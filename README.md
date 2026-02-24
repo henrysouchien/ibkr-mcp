@@ -16,7 +16,7 @@ MCP server for Interactive Brokers Gateway — 6 tools for market data and accou
 ## Install
 
 ```bash
-pip install ibkr-mcp
+pip install interactive-brokers-mcp
 ```
 
 ## Prerequisites
