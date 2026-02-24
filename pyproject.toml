@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "ibkr-mcp"
+name = "interactive-brokers-mcp"
 version = "0.1.0"
 description = "MCP server for Interactive Brokers Gateway — 6 tools for market data and account access via Claude"
 readme = "README.md"
