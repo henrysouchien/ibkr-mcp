@@ -1,0 +1,78 @@
+# IBKR exchange code -> ISO MIC mapping for equity suffix resolution
+ibkr_exchange_to_mic:
+  # Execution venues
+  LSEETF: XLON
+  AEB: XAMS
+  SBF: XPAR
+  IBIS: XETR
+  VIRTX: XSWX
+  BVME: XMIL
+  TSE: XTSE
+  ASX: XASX
+  # Listing exchanges (used as fallback when execution venue is unrecognized)
+  LSE: XLON
+
+# IBKR futures root symbol -> FMP commodity symbol
+ibkr_futures_to_fmp:
+  # Index Futures
+  ES: ESUSD
+  MES: ESUSD
+  NQ: NQUSD
+  MNQ: NQUSD
+  YM: YMUSD
+  RTY: RTYUSD
+  # International Index Futures
+  NKD: "^N225"
+  MNK: "^N225"
+  NIY: "^N225"
+  IBV: "^BVSP"
+  ESTX50: "^STOXX50E"
+  DAX: "^GDAXI"
+  Z: "^FTSE"
+  HSI: "^HSI"
+  # Metals
+  GC: GCUSD
+  MGC: MGCUSD
+  SI: SIUSD
+  HG: HGUSD
+  PL: PLUSD
+  PA: PAUSD
+  # Energy
+  CL: CLUSD
+  BZ: BZUSD
+  NG: NGUSD
+  # Fixed Income
+  ZB: ZBUSD
+  ZN: ZNUSD
+  ZF: ZFUSD
+  ZT: ZTUSD
+
+# IBKR exchange routing for ContFuture qualification
+ibkr_futures_exchanges:
+  ES: { exchange: CME, currency: USD }
+  MES: { exchange: CME, currency: USD }
+  NQ: { exchange: CME, currency: USD }
+  MNQ: { exchange: CME, currency: USD }
+  YM: { exchange: CBOT, currency: USD }
+  RTY: { exchange: CME, currency: USD }
+  NKD: { exchange: CME, currency: USD }
+  MNK: { exchange: CME, currency: USD }
+  NIY: { exchange: CME, currency: JPY }
+  IBV: { exchange: CME, currency: USD }
+  ESTX50: { exchange: EUREX, currency: EUR }
+  DAX: { exchange: EUREX, currency: EUR }
+  Z: { exchange: ICEEU, currency: GBP }
+  HSI: { exchange: HKFE, currency: HKD }
+  GC: { exchange: COMEX, currency: USD }
+  MGC: { exchange: COMEX, currency: USD }
+  SI: { exchange: COMEX, currency: USD }
+  HG: { exchange: COMEX, currency: USD }
+  PL: { exchange: NYMEX, currency: USD }
+  PA: { exchange: NYMEX, currency: USD }
+  CL: { exchange: NYMEX, currency: USD }
+  BZ: { exchange: NYMEX, currency: USD }
+  NG: { exchange: NYMEX, currency: USD }
+  ZB: { exchange: CBOT, currency: USD }
+  ZN: { exchange: CBOT, currency: USD }
+  ZF: { exchange: CBOT, currency: USD }
+  ZT: { exchange: CBOT, currency: USD }
