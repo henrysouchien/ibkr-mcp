@@ -21,6 +21,10 @@ dependencies = [
     "zstandard",
 ]
 
+[project.urls]
+Homepage = "https://github.com/henrysouchien/ibkr-mcp"
+Source = "https://github.com/henrysouchien/ibkr-mcp"
+
 [project.scripts]
 ibkr-mcp = "ibkr.server:main"
 
