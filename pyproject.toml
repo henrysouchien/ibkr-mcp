@@ -7,7 +7,7 @@ name = "interactive-brokers-mcp"
 version = "0.2.0"
 description = "MCP server for Interactive Brokers Gateway — 6 tools for market data and account access via Claude"
 readme = "README.md"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 requires-python = ">=3.11"
 dependencies = [
     "ib_async",
