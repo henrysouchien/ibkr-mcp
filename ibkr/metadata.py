@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
-from .contracts import resolve_futures_contract
+from .contracts import _futures_exchange_meta, resolve_futures_contract
 from .exceptions import IBKRContractError
 
 
@@ -90,6 +91,51 @@ def fetch_contract_details(
     return [_normalize_contract_detail(detail) for detail in details]
 
 
+def fetch_futures_months(ib, symbol: str) -> list[dict[str, Any]]:
+    """Discover available contract months for a futures root symbol.
+
+    Returns list of dicts sorted by last_trade_date ascending, with keys:
+    con_id, symbol, exchange, currency, last_trade_date, multiplier, trading_class
+    Expired contracts (last_trade_date < today) are filtered out.
+    """
+    from ib_async import Future
+
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        raise IBKRContractError("Symbol is required")
+
+    exchange, currency = _futures_exchange_meta(sym)
+    contract = Future(symbol=sym, exchange=exchange, currency=currency)
+    details = list(ib.reqContractDetails(contract) or [])
+    if not details:
+        raise IBKRContractError(f"No futures contract months found for symbol={sym}")
+
+    today = datetime.date.today().strftime("%Y%m%d")
+    months: list[dict[str, Any]] = []
+    for detail in details:
+        normalized = _normalize_contract_detail(detail)
+        last_trade_date = normalized.get("last_trade_date")
+        if last_trade_date is None:
+            continue
+        last_trade_date_str = str(last_trade_date)
+        if last_trade_date_str < today:
+            continue
+        months.append(
+            {
+                "con_id": normalized.get("con_id"),
+                "symbol": normalized.get("symbol"),
+                "exchange": normalized.get("exchange"),
+                "currency": normalized.get("currency"),
+                "last_trade_date": last_trade_date_str,
+                "multiplier": normalized.get("multiplier"),
+                "trading_class": normalized.get("trading_class"),
+            }
+        )
+
+    months.sort(key=lambda row: str(row.get("last_trade_date") or ""))
+    return months
+
+
 def _normalize_chain(chain) -> dict[str, Any]:
     strikes_raw = list(getattr(chain, "strikes", []) or [])
     strikes = sorted(
@@ -155,3 +201,46 @@ def fetch_option_chain(
         "con_id": int(con_id),
         "chains": [_normalize_chain(chain) for chain in chains],
     }
+
+
+def resolve_bond_by_cusip(
+    ib,
+    cusip: str,
+    currency: str = "USD",
+) -> int | None:
+    """Search IBKR bond contracts and match CUSIP from secIdList.
+
+    IBKR's qualifyContracts() does not support secIdType=CUSIP for bonds.
+    Instead, we search by issuer symbol via reqContractDetails() and match
+    the CUSIP from the secIdList field on each ContractDetails result.
+
+    US Treasuries use symbol 'US-T'. Non-Treasury bonds not yet supported.
+
+    Returns conId if found, None otherwise.
+    """
+    from ib_async import Contract
+
+    cusip = cusip.strip().upper()
+    if not cusip:
+        return None
+
+    # US Treasury CUSIPs start with 912 (Bureau of Fiscal Service)
+    if not cusip.startswith("912"):
+        return None  # Non-Treasury bonds not yet supported
+
+    contract = Contract(secType="BOND", symbol="US-T", currency=currency)
+    details = list(ib.reqContractDetails(contract) or [])
+
+    for detail in details:
+        sec_id_list = getattr(detail, "secIdList", None) or []
+        for tag_value in sec_id_list:
+            if (
+                getattr(tag_value, "tag", "") == "CUSIP"
+                and getattr(tag_value, "value", "").strip().upper() == cusip
+            ):
+                con = getattr(detail, "contract", None)
+                con_id = getattr(con, "conId", None) if con else None
+                if con_id:
+                    return int(con_id)
+
+    return None

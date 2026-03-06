@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-InstrumentType = Literal["equity", "option", "futures", "fx", "fx_artifact", "bond", "unknown"]
+InstrumentType = Literal["equity", "option", "futures", "fx", "fx_artifact", "bond", "income", "unknown"]
 
 _VALID_INSTRUMENT_TYPES = {
     "equity",
@@ -13,6 +13,7 @@ _VALID_INSTRUMENT_TYPES = {
     "fx",
     "fx_artifact",
     "bond",
+    "income",
     "unknown",
 }
 

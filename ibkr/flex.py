@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 import importlib
+import re
+import time
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -21,7 +23,7 @@ import certifi
 import yaml
 from ib_async import FlexReport
 
-from ._logging import trading_logger
+from ._logging import logger
 from ._types import InstrumentType
 from ._vendor import normalize_strike, safe_float
 
@@ -33,6 +35,7 @@ except Exception:
 
 
 _warned_missing_ticker_resolver = False
+_FUTURES_MONTH_CODES = set("FGHJKMNQUVXZ")
 
 
 def resolve_fmp_ticker(
@@ -54,7 +57,7 @@ def resolve_fmp_ticker(
 
     global _warned_missing_ticker_resolver
     if not _warned_missing_ticker_resolver:
-        trading_logger.warning(
+        logger.warning(
             "utils.ticker_resolver unavailable; IBKR Flex symbol normalization fallback is active."
         )
         _warned_missing_ticker_resolver = True
@@ -75,9 +78,9 @@ def _load_ibkr_exchange_mappings() -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except FileNotFoundError:
-        trading_logger.warning("IBKR exchange_mappings.yaml not found at %s", path)
+        logger.warning("IBKR exchange_mappings.yaml not found at %s", path)
     except Exception as exc:
-        trading_logger.warning("Failed to load IBKR exchange mappings from %s: %s", path, exc)
+        logger.warning("Failed to load IBKR exchange mappings from %s: %s", path, exc)
     return {}
 
 
@@ -280,7 +283,7 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
             _get_attr(trade, "openCloseIndicator", "openClose"),
         )
         if trade_type is None:
-            trading_logger.warning(
+            logger.warning(
                 "Skipping Flex trade with unmappable side/open-close: buySell=%s openClose=%s",
                 _get_attr(trade, "buySell", "side", "tradeType"),
                 _get_attr(trade, "openCloseIndicator", "openClose"),
@@ -289,7 +292,7 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
 
         trade_date = _parse_flex_date(_get_attr(trade, "tradeDate", "dateTime", "date"))
         if trade_date is None:
-            trading_logger.warning("Skipping Flex trade with invalid date: %s", trade)
+            logger.warning("Skipping Flex trade with invalid date: %s", trade)
             continue
 
         asset_category = str(_get_attr(trade, "assetCategory", "assetClass", default="")).upper()
@@ -318,7 +321,7 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
             symbol = underlying
             raw_underlying = _get_attr(trade, "underlyingSymbol", "underlying")
             if not raw_underlying or str(raw_underlying).strip() == "":
-                trading_logger.warning(
+                logger.warning(
                     "FUT trade missing underlyingSymbol; using raw symbol %s "
                     "(may not match FMP mapping)",
                     symbol,
@@ -346,7 +349,7 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
         if is_futures and multiplier != 1:
             quantity = quantity * multiplier
         if quantity <= 0:
-            trading_logger.warning("Skipping Flex trade with non-positive quantity: %s", trade)
+            logger.warning("Skipping Flex trade with non-positive quantity: %s", trade)
             continue
 
         trade_price = safe_float(_get_attr(trade, "tradePrice", "price"), 0.0)
@@ -389,6 +392,66 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
         )
 
     return normalized
+
+
+def normalize_flex_prior_positions(
+    rows: list[dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Extract option price history from PriorPeriodPosition rows.
+
+    Returns list of {ticker, date, price, currency} dicts.
+    Price is multiplied by multiplier (matching trade price convention
+    at flex.py:356).
+    """
+    result: List[Dict[str, Any]] = []
+
+    for row in rows:
+        row_dict = _row_to_dict(row)
+        asset_cat = str(row_dict.get("assetCategory", "")).upper()
+        if asset_cat != "OPT":
+            continue
+
+        underlying = str(
+            row_dict.get("underlyingSymbol", "") or ""
+        ).strip().upper()
+        put_call = row_dict.get("putCall")
+        strike = row_dict.get("strike")
+        expiry = row_dict.get("expiry")
+        date_str = str(row_dict.get("date", "")).strip()
+        currency = str(row_dict.get("currency", "USD") or "USD").upper()
+
+        if not underlying or not date_str:
+            continue
+
+        raw_price = safe_float(row_dict.get("price"), default=None)
+        if raw_price is None:
+            continue
+
+        ticker = _build_option_symbol(
+            underlying=underlying,
+            put_call=put_call,
+            strike=strike,
+            expiry=expiry,
+        )
+        if not ticker or ticker == underlying:
+            continue
+
+        multiplier = safe_float(row_dict.get("multiplier"), 1.0)
+        if multiplier <= 0:
+            multiplier = 1.0
+        if multiplier > 1:
+            price = raw_price * multiplier
+        else:
+            price = raw_price
+
+        result.append({
+            "ticker": ticker,
+            "date": date_str,
+            "price": price,
+            "currency": currency,
+        })
+
+    return result
 
 
 def _normalize_identifier(value: Any) -> str | None:
@@ -466,7 +529,7 @@ def _extract_rows(report: Any, topic: str) -> list[dict[str, Any]]:
         # Older ib_async versions may not expose parseNumbers kwarg.
         rows = report.extract(topic)
     except Exception as exc:
-        trading_logger.warning("Failed to parse IBKR Flex %s rows: %s", topic, exc)
+        logger.warning("Failed to parse IBKR Flex %s rows: %s", topic, exc)
         return []
     return [_row_to_dict(row) for row in rows]
 
@@ -476,6 +539,48 @@ def _normalize_flex_currency(value: Any) -> str:
     if len(text) == 3 and text.isalpha():
         return text
     return "USD"
+
+
+@lru_cache(maxsize=1)
+def _load_futures_root_symbols() -> tuple[str, ...]:
+    try:
+        from brokerage.futures import load_contract_specs
+
+        specs = load_contract_specs()
+        roots = sorted(
+            (
+                str(symbol or "").strip().upper()
+                for symbol in (specs or {}).keys()
+                if str(symbol or "").strip()
+            ),
+            key=len,
+            reverse=True,
+        )
+        return tuple(roots)
+    except Exception:
+        return tuple()
+
+
+def _strip_futures_contract_month(raw_symbol: Any) -> str:
+    symbol = str(raw_symbol or "").strip().upper()
+    if not symbol:
+        return ""
+
+    compact = "".join(ch for ch in symbol if ch.isalnum()).upper()
+    if not compact:
+        return symbol
+
+    for root in _load_futures_root_symbols():
+        if not compact.startswith(root):
+            continue
+        suffix = compact[len(root):]
+        if len(suffix) >= 2 and suffix[0] in _FUTURES_MONTH_CODES and suffix[1:].isdigit():
+            return root
+
+    match = re.match(r"^([A-Z]{1,4})([FGHJKMNQUVXZ]\d{1,4})$", compact)
+    if match:
+        return str(match.group(1) or "").upper()
+    return compact
 
 
 def _canonical_cash_type(raw_type: str) -> str:
@@ -508,8 +613,6 @@ def _cash_classification(raw_type: str, amount: float) -> tuple[str, bool, float
         return "transfer", False, 0.0, False
 
     fee_types = {
-        "BROKERINTPAID",
-        "BONDINTPAID",
         "FEES",
         "COMMADJ",
         "ADVISORFEES",
@@ -534,7 +637,50 @@ def _income_trade_type_for_cash_type(raw_type: str) -> str:
     return ""
 
 
-def normalize_flex_cash_income_trades(raw_cash_rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+def _is_synthetic_transaction_id(
+    transaction_id: Any,
+    *,
+    synthetic_prefixes: tuple[str, ...],
+) -> bool:
+    transaction_id_text = str(transaction_id or "").strip()
+    if not transaction_id_text:
+        return True
+    return any(transaction_id_text.startswith(prefix) for prefix in synthetic_prefixes)
+
+
+def _dedup_account_id(row: dict[str, Any]) -> str:
+    """Normalize account_id for dedup keys.
+
+    IBKR Flex reports some rows with ``accountId="-"`` (summary rows) and
+    others with the real account ID.  Treat ``"-"`` as empty so these
+    collapse during dedup.
+    """
+    acct = str(row.get("account_id") or "").strip()
+    return "" if acct == "-" else acct
+
+
+def _select_dedup_winner(
+    rows: list[dict[str, Any]],
+    *,
+    synthetic_prefixes: tuple[str, ...],
+) -> dict[str, Any]:
+    real_rows = [
+        row
+        for row in rows
+        if not _is_synthetic_transaction_id(
+            row.get("transaction_id"),
+            synthetic_prefixes=synthetic_prefixes,
+        )
+    ]
+    if real_rows:
+        return min(real_rows, key=lambda row: str(row.get("transaction_id") or ""))
+    return min(rows, key=lambda row: str(row.get("transaction_id") or ""))
+
+
+def normalize_flex_cash_income_trades(
+    raw_cash_rows: Iterable[dict[str, Any]],
+    base_currency: str = "USD",
+) -> list[dict[str, Any]]:
     """Convert raw Flex CashTransaction dividend/interest rows to trade-format records."""
     normalized: list[dict[str, Any]] = []
 
@@ -588,12 +734,185 @@ def normalize_flex_cash_income_trades(raw_cash_rows: Iterable[dict[str, Any]]) -
                 "transaction_id": str(transaction_id),
                 "is_option": False,
                 "is_futures": False,
-                "instrument_type": "fx_artifact",
+                "instrument_type": "income",
                 "account_id": account_id,
                 "account_name": account_name,
                 "_institution": "ibkr",
             }
         )
+
+    # Pass 1: segment dedup — collapse identical events reported per IBKR segment.
+    # Exclude account_id because IBKR reports the same event with different
+    # accountId values across segments (e.g. "U2471778" vs "-").
+    segment_grouped: dict[tuple[str, str, str, float, str], list[dict[str, Any]]] = {}
+    for row in normalized:
+        event_dt = _parse_flex_date(row.get("date"))
+        segment_key = (
+            event_dt.date().isoformat() if event_dt is not None else "",
+            str(row.get("symbol") or "").strip().upper(),
+            str(row.get("type") or "").strip().upper(),
+            round(_parse_cash_amount(row.get("amount"), default=0.0), 8),
+            _normalize_flex_currency(row.get("currency")),
+        )
+        segment_grouped.setdefault(segment_key, []).append(row)
+
+    segment_deduped = [
+        _select_dedup_winner(rows, synthetic_prefixes=("income:",))
+        for rows in segment_grouped.values()
+    ]
+
+    # Pass 2: cross-currency dedup — same event in HKD and USD → keep base currency.
+    normalized_base_currency = _normalize_flex_currency(base_currency)
+    cross_currency_grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in segment_deduped:
+        event_dt = _parse_flex_date(row.get("date"))
+        currency_key = (
+            event_dt.date().isoformat() if event_dt is not None else "",
+            str(row.get("symbol") or "").strip().upper(),
+            str(row.get("type") or "").strip().upper(),
+        )
+        cross_currency_grouped.setdefault(currency_key, []).append(row)
+
+    normalized = []
+    for grouped_rows in cross_currency_grouped.values():
+        if len(grouped_rows) <= 1:
+            normalized.extend(grouped_rows)
+            continue
+
+        currencies = {_normalize_flex_currency(row.get("currency")) for row in grouped_rows}
+        if len(currencies) <= 1:
+            normalized.extend(grouped_rows)
+            continue
+
+        base_currency_rows = [
+            row
+            for row in grouped_rows
+            if _normalize_flex_currency(row.get("currency")) == normalized_base_currency
+        ]
+        if base_currency_rows:
+            normalized.extend(base_currency_rows)
+            continue
+
+        normalized.extend(grouped_rows)
+
+    normalized.sort(
+        key=lambda row: (
+            _parse_flex_date(row.get("date")) or datetime.min,
+            str(row.get("transaction_id") or ""),
+            str(row.get("account_id") or ""),
+        )
+    )
+    return normalized
+
+
+def normalize_flex_futures_mtm(
+    raw_stmtfunds_rows: Iterable[dict[str, Any]],
+    base_currency: str = "USD",
+) -> list[dict[str, Any]]:
+    """Convert Flex StmtFunds futures Position MTM rows to normalized cash-settlement events."""
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, float, str]] = set()
+    row_group_keys: list[tuple[str, str, str]] = []
+
+    for index, row in enumerate(raw_stmtfunds_rows):
+        if not isinstance(row, dict):
+            continue
+
+        asset_category = str(row.get("assetCategory") or row.get("assetClass") or "").strip().upper()
+        if asset_category != "FUT":
+            continue
+
+        description = str(row.get("activityDescription") or row.get("description") or "").strip()
+        description_upper = description.upper()
+        if "POSITION MTM" not in description_upper:
+            continue
+        if description_upper.startswith("BUY") or description_upper.startswith("SELL"):
+            continue
+
+        event_dt = _parse_flex_date(row.get("reportDate") or row.get("dateTime") or row.get("date"))
+        if event_dt is None:
+            continue
+
+        amount = _parse_cash_amount(row.get("amount"), default=0.0)
+        if amount == 0.0:
+            continue
+
+        currency = _normalize_flex_currency(row.get("currency"))
+        account_id = _normalize_identifier(row.get("accountId") or row.get("accountID"))
+        # Skip summary/consolidated rows (accountId="-") — these duplicate the
+        # per-account rows and cause double-counting in cash replay.
+        if account_id == "-":
+            continue
+        account_name = _normalize_identifier(
+            row.get("accountAlias")
+            or row.get("acctAlias")
+            or row.get("accountName")
+        )
+        provider_account_ref = _normalize_identifier(row.get("accountAlias"))
+        raw_symbol = str(row.get("symbol") or "").strip().upper()
+
+        dedup_key = (
+            account_id or "",
+            event_dt.date().isoformat(),
+            raw_symbol,
+            round(amount, 8),
+            currency,
+        )
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        symbol = _strip_futures_contract_month(raw_symbol)
+        transaction_id = (
+            f"stmtfunds_mtm:{account_id or account_name or 'unknown'}:{event_dt.date().isoformat()}:"
+            f"{raw_symbol or symbol or 'UNKNOWN'}:{amount:.8f}:{currency}:{index}"
+        )
+
+        normalized.append(
+            {
+                "provider": "ibkr_flex",
+                "institution": "ibkr",
+                "_institution": "ibkr",
+                "account_id": account_id,
+                "account_name": account_name,
+                "provider_account_ref": provider_account_ref,
+                "date": event_dt,
+                "symbol": symbol,
+                "description": description,
+                "amount": float(amount),
+                "currency": currency,
+                "transaction_id": transaction_id,
+            }
+        )
+        row_group_keys.append((account_id or "", event_dt.date().isoformat(), raw_symbol))
+
+    normalized_base_currency = _normalize_flex_currency(base_currency)
+    grouped_indexes: dict[tuple[str, str, str], list[int]] = {}
+    for row_index, group_key in enumerate(row_group_keys):
+        grouped_indexes.setdefault(group_key, []).append(row_index)
+
+    keep_indexes: set[int] = set(range(len(normalized)))
+    for grouped_row_indexes in grouped_indexes.values():
+        if len(grouped_row_indexes) <= 1:
+            continue
+
+        currencies = {str(normalized[idx].get("currency") or "").upper() for idx in grouped_row_indexes}
+        if len(currencies) <= 1:
+            continue
+
+        base_currency_indexes = [
+            idx
+            for idx in grouped_row_indexes
+            if str(normalized[idx].get("currency") or "").upper() == normalized_base_currency
+        ]
+        if not base_currency_indexes:
+            continue
+
+        for idx in grouped_row_indexes:
+            if idx not in base_currency_indexes:
+                keep_indexes.discard(idx)
+
+    normalized = [row for idx, row in enumerate(normalized) if idx in keep_indexes]
 
     normalized.sort(
         key=lambda row: (
@@ -740,6 +1059,7 @@ def _normalize_transfer_row(raw_row: dict[str, Any], row_index: int) -> dict[str
 def normalize_flex_cash_rows(
     cash_rows: Iterable[dict[str, Any]],
     transfer_rows: Iterable[dict[str, Any]],
+    base_currency: str = "USD",
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     primary_overlap_keys: set[tuple[str, str, str, str, str, float, str]] = set()
@@ -759,6 +1079,58 @@ def normalize_flex_cash_rows(
             continue
         normalized.append(normalized_row)
 
+    # Pass 1: segment dedup — exclude account_id (same event, different accountId per segment)
+    segment_grouped: dict[tuple[str, str, str, float, str], list[dict[str, Any]]] = {}
+    for row in normalized:
+        event_dt = _parse_flex_date(row.get("event_datetime") or row.get("date"))
+        segment_key = (
+            event_dt.date().isoformat() if event_dt is not None else "",
+            str(row.get("flow_type") or "").strip().lower(),
+            str(row.get("raw_type") or "").strip().upper(),
+            round(_parse_cash_amount(row.get("amount"), default=0.0), 8),
+            _normalize_flex_currency(row.get("currency")),
+        )
+        segment_grouped.setdefault(segment_key, []).append(row)
+
+    segment_deduped = [
+        _select_dedup_winner(rows, synthetic_prefixes=("cash:", "transfer:"))
+        for rows in segment_grouped.values()
+    ]
+
+    # Pass 2: cross-currency dedup — same event in HKD and USD → keep base currency
+    normalized_base_currency = _normalize_flex_currency(base_currency)
+    cross_currency_grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in segment_deduped:
+        event_dt = _parse_flex_date(row.get("event_datetime") or row.get("date"))
+        currency_key = (
+            event_dt.date().isoformat() if event_dt is not None else "",
+            str(row.get("flow_type") or "").strip().lower(),
+            str(row.get("raw_type") or "").strip().upper(),
+        )
+        cross_currency_grouped.setdefault(currency_key, []).append(row)
+
+    normalized = []
+    for grouped_rows in cross_currency_grouped.values():
+        if len(grouped_rows) <= 1:
+            normalized.extend(grouped_rows)
+            continue
+
+        currencies = {_normalize_flex_currency(row.get("currency")) for row in grouped_rows}
+        if len(currencies) <= 1:
+            normalized.extend(grouped_rows)
+            continue
+
+        base_currency_rows = [
+            row
+            for row in grouped_rows
+            if _normalize_flex_currency(row.get("currency")) == normalized_base_currency
+        ]
+        if base_currency_rows:
+            normalized.extend(base_currency_rows)
+            continue
+
+        normalized.extend(grouped_rows)
+
     normalized.sort(
         key=lambda row: (
             _parse_flex_date(row.get("event_datetime") or row.get("date")) or datetime.min,
@@ -769,32 +1141,175 @@ def normalize_flex_cash_rows(
     return normalized
 
 
+def _redact_credentials(msg: str, token: str, query_id: str) -> str:
+    """Replace token/query_id in error messages with ***."""
+    if token and token in msg:
+        msg = msg.replace(token, "***")
+    if query_id and query_id in msg:
+        msg = msg.replace(query_id, "***")
+    return msg
+
+
+def _check_flex_error_response_xml(root: Any) -> tuple[int | None, str | None]:
+    """Check raw XML root element for IBKR error response."""
+    if root is None:
+        return None, None
+
+    error_code_el = root.find("ErrorCode")
+    if error_code_el is None:
+        error_code_el = root.find(".//ErrorCode")
+    if error_code_el is None:
+        return None, None
+
+    try:
+        code = int(error_code_el.text)
+    except (TypeError, ValueError):
+        # Malformed ErrorCode (non-integer) - log warning, treat as no error.
+        logger.warning(
+            "IBKR Flex response contains non-integer ErrorCode: %r",
+            getattr(error_code_el, "text", None),
+        )
+        return None, None
+
+    message_el = root.find("ErrorMessage")
+    if message_el is None:
+        message_el = root.find(".//ErrorMessage")
+    message = message_el.text if message_el is not None else f"IBKR Flex error {code}"
+    return code, message
+
+
+def _check_flex_error_response(report: Any) -> tuple[int | None, str | None]:
+    """Check if a FlexReport contains an error response instead of data."""
+    root = getattr(report, "root", None)
+    return _check_flex_error_response_xml(root)
+
+
+def _download_flex_report(
+    token: str,
+    query_id: str,
+    *,
+    poll_interval: int = 3,
+    poll_timeout: int = 60,
+) -> tuple[Any | None, str | None]:
+    """Download IBKR Flex report with correct Phase 2 polling.
+
+    ib_async's FlexReport.download() has a bug: its Phase 2 poll loop checks
+    root[0].tag == "code" but IBKR returns <Status> as root[0], so the loop
+    exits after one 1-second poll. We implement both phases ourselves.
+
+    Phase 1: POST token+queryId -> get reference code + URL
+    Phase 2: Poll reference URL every poll_interval seconds until data or timeout
+    """
+    from urllib.parse import urlencode
+    from urllib.request import urlopen
+    import xml.etree.ElementTree as ET
+
+    # --- Phase 1: Request statement generation ---
+    base_url = os.getenv(
+        "IB_FLEXREPORT_URL",
+        "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest?",
+    )
+    params = urlencode({"t": token, "q": query_id, "v": "3"})
+    url = f"{base_url}{params}"
+
+    try:
+        resp = urlopen(url, timeout=30)
+        data = resp.read()
+        root = ET.fromstring(data)
+    except Exception as exc:
+        exc_msg = _redact_credentials(str(exc), token, query_id)
+        return None, f"IBKR Flex Phase 1 request failed: {exc_msg}"
+
+    status_el = root.find("Status")
+    if status_el is None or (status_el.text or "").strip() != "Success":
+        error_code_el = root.find("ErrorCode")
+        error_msg_el = root.find("ErrorMessage")
+        code = error_code_el.text if error_code_el is not None else "?"
+        msg = error_msg_el.text if error_msg_el is not None else "unknown"
+        return None, f"IBKR Flex Phase 1 error {code}: {msg}"
+
+    ref_code_el = root.find("ReferenceCode")
+    ref_url_el = root.find("Url")
+    if ref_code_el is None or ref_url_el is None:
+        return None, "IBKR Flex Phase 1 missing ReferenceCode or Url"
+
+    ref_code = (ref_code_el.text or "").strip()
+    ref_url = (ref_url_el.text or "").strip()
+    if not ref_code or not ref_url:
+        return None, "IBKR Flex Phase 1 returned empty ReferenceCode or Url"
+
+    # --- Phase 2: Poll for statement ---
+    logger.info("IBKR Flex statement requested (ref %s), polling...", ref_code)
+    elapsed = 0
+
+    while elapsed < poll_timeout:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        poll_params = urlencode({"q": ref_code, "t": token, "v": "3"})
+        poll_url = f"{ref_url}?{poll_params}"
+        try:
+            resp = urlopen(poll_url, timeout=30)
+            poll_data = resp.read()
+            poll_root = ET.fromstring(poll_data)
+        except Exception as exc:
+            exc_msg = _redact_credentials(str(exc), token, query_id)
+            return None, f"IBKR Flex Phase 2 poll failed: {exc_msg}"
+
+        error_code, error_msg = _check_flex_error_response_xml(poll_root)
+        if error_code == 1019:
+            logger.info(
+                "IBKR Flex still generating (ref %s, %ds elapsed)...",
+                ref_code,
+                elapsed,
+            )
+            continue
+
+        if error_code is not None:
+            return None, f"IBKR Flex Phase 2 error {error_code}: {error_msg}"
+
+        report = FlexReport()
+        report.data = poll_data
+        report.root = poll_root
+        logger.info(
+            "IBKR Flex statement retrieved (ref %s, %ds elapsed, %d bytes)",
+            ref_code,
+            elapsed,
+            len(poll_data),
+        )
+        return report, None
+
+    return None, (
+        f"IBKR Flex statement generation timed out after {poll_timeout}s "
+        f"(ref {ref_code})"
+    )
+
+
 def _load_flex_report(
     *,
     token: str = "",
     query_id: str = "",
     path: Optional[str] = None,
 ) -> tuple[Any | None, str | None]:
+    # --- Path loading ---
     if path:
         if not Path(path).exists():
             return None, f"IBKR Flex XML file not found: {path}"
         try:
-            return FlexReport(path=path), None
+            report = FlexReport(path=path)
         except Exception as exc:
             return None, f"Failed to load IBKR Flex XML from {path}: {exc}"
 
+        # A saved XML file could contain an error response
+        error_code, error_msg = _check_flex_error_response(report)
+        if error_code is not None:
+            return None, f"IBKR Flex error {error_code} in {path}: {error_msg}"
+        return report, None
+
+    # --- Download ---
     if not token or not query_id:
         return None, "IBKR Flex credentials missing; skipping Flex download"
-
-    try:
-        return FlexReport(token=token, queryId=query_id), None
-    except Exception as exc:
-        exc_msg = str(exc)
-        if token and token in exc_msg:
-            exc_msg = exc_msg.replace(token, "***")
-        if query_id and query_id in exc_msg:
-            exc_msg = exc_msg.replace(query_id, "***")
-        return None, f"IBKR Flex download failed: {exc_msg}"
+    return _download_flex_report(token, query_id)
 
 
 def fetch_ibkr_flex_payload(
@@ -802,10 +1317,12 @@ def fetch_ibkr_flex_payload(
     query_id: str = "",
     path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Download/load IBKR Flex report and return trades + cash rows + fetch diagnostics."""
+    """Download/load IBKR Flex report and return trades + cash rows + MTM + diagnostics."""
     payload: Dict[str, Any] = {
         "trades": [],
         "cash_rows": [],
+        "futures_mtm": [],
+        "option_price_history": [],
         "fetch_window_start": None,
         "fetch_window_end": None,
         "pagination_exhausted": False,
@@ -813,11 +1330,12 @@ def fetch_ibkr_flex_payload(
         "fetch_error": None,
         "cash_transaction_section_present": False,
         "transfer_section_present": False,
+        "stmtfunds_section_present": False,
     }
 
     report, load_error = _load_flex_report(token=token, query_id=query_id, path=path)
     if load_error is not None:
-        trading_logger.warning("%s", load_error)
+        logger.warning("%s", load_error)
         payload["fetch_error"] = load_error
         return payload
 
@@ -828,8 +1346,10 @@ def fetch_ibkr_flex_payload(
     topics = _report_topics(report)
     cash_topic_present = "CashTransaction" in topics
     transfer_topic_present = "Transfer" in topics
+    stmtfunds_topic_present = "StatementOfFundsLine" in topics
     payload["cash_transaction_section_present"] = cash_topic_present
     payload["transfer_section_present"] = transfer_topic_present
+    payload["stmtfunds_section_present"] = stmtfunds_topic_present
 
     raw_trades = _extract_rows(report, "Trade")
     if raw_trades:
@@ -837,14 +1357,18 @@ def fetch_ibkr_flex_payload(
 
     raw_cash_rows = _extract_rows(report, "CashTransaction")
     raw_transfer_rows = _extract_rows(report, "Transfer")
+    raw_stmtfunds_rows = _extract_rows(report, "StatementOfFundsLine") if stmtfunds_topic_present else []
+    raw_prior_positions = _extract_rows(report, "PriorPeriodPosition")
     payload["cash_rows"] = normalize_flex_cash_rows(raw_cash_rows, raw_transfer_rows)
     payload["trades"].extend(normalize_flex_cash_income_trades(raw_cash_rows))
+    payload["futures_mtm"] = normalize_flex_futures_mtm(raw_stmtfunds_rows)
+    payload["option_price_history"] = normalize_flex_prior_positions(raw_prior_positions)
 
     partial_messages: list[str] = []
     if not cash_topic_present:
         partial_messages.append("CashTransaction section missing in Flex report")
     if not cash_topic_present and not transfer_topic_present:
-        trading_logger.warning(
+        logger.warning(
             "IBKR Flex report missing cash sections (CashTransaction, Transfer); "
             "provider-flow authority remains non-authoritative."
         )
@@ -871,3 +1395,60 @@ def fetch_ibkr_flex_trades(
         raise FileNotFoundError(f"IBKR Flex XML file not found: {path}")
     payload = fetch_ibkr_flex_payload(token=token, query_id=query_id, path=path)
     return list(payload.get("trades") or [])
+
+
+def extract_statement_cash(
+    statement_db_path: str,
+) -> dict[str, Any] | None:
+    """Extract starting/ending cash from materialized IBKR statement SQLite.
+
+    Searches for any table matching cash_report% and extracts the Base
+    Currency Summary Starting/Ending Cash rows. Returns None if the file
+    doesn't exist, the table is missing, or required rows are absent.
+    """
+    if not statement_db_path or not Path(statement_db_path).exists():
+        return None
+    import sqlite3
+
+    conn = sqlite3.connect(statement_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Find the cash_report table (name varies across statement formats)
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'cash_report%' ORDER BY name"
+            ).fetchall()
+        ]
+        if not tables:
+            return None
+        # Prefer __all (union) if it exists, else first variant
+        table = next((t for t in tables if t.endswith("__all")), tables[0])
+        rows = conn.execute(
+            f"SELECT currency_summary, total FROM [{table}] "
+            "WHERE currency = 'Base Currency Summary' "
+            "AND currency_summary IN ('Starting Cash', 'Ending Cash')"
+        ).fetchall()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+    result: dict[str, Any] = {}
+    for row in rows:
+        label = str(row["currency_summary"]).strip()
+        try:
+            value = float(row["total"])
+        except (TypeError, ValueError):
+            continue
+        if label == "Starting Cash":
+            result["starting_cash_usd"] = value
+        elif label == "Ending Cash":
+            result["ending_cash_usd"] = value
+
+    if "starting_cash_usd" not in result or "ending_cash_usd" not in result:
+        return None
+    result["source"] = "ibkr_statement"
+    result["db_path"] = str(statement_db_path)
+    return result

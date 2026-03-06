@@ -8,6 +8,7 @@ from typing import Any
 
 import pandas as pd
 
+from .config import IBKR_PNL_POLL_INTERVAL, IBKR_PNL_TIMEOUT
 from .exceptions import IBKRTimeoutError
 
 
@@ -20,6 +21,26 @@ _POSITION_COLUMNS = [
     "con_id",
     "position",
     "avg_cost",
+]
+
+_PORTFOLIO_COLUMNS = [
+    "account",
+    "symbol",
+    "sec_type",
+    "currency",
+    "exchange",
+    "con_id",
+    "local_symbol",
+    "last_trade_date",
+    "strike",
+    "right",
+    "multiplier",
+    "position",
+    "avg_cost",
+    "market_price",
+    "market_value",
+    "unrealized_pnl",
+    "realized_pnl",
 ]
 
 _SUMMARY_TAGS = {
@@ -100,6 +121,74 @@ def fetch_positions(ib, account_id: str | None = None) -> pd.DataFrame:
     return frame.sort_values(["account", "symbol"], na_position="last").reset_index(drop=True)
 
 
+def fetch_portfolio_items(ib, account_id: str | None = None) -> pd.DataFrame:
+    """Fetch IBKR portfolio items with market values via reqAccountUpdates."""
+    items = list(ib.portfolio() or [])
+    if not items:
+        ib.reqAccountUpdates(account=account_id or "")
+        items = list(ib.portfolio() or [])
+
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        acct = getattr(item, "account", None)
+        if account_id and acct != account_id:
+            continue
+        contract = getattr(item, "contract", None)
+        rows.append(
+            {
+                "account": acct,
+                "symbol": getattr(contract, "symbol", None) if contract else None,
+                "sec_type": getattr(contract, "secType", None) if contract else None,
+                "currency": getattr(contract, "currency", None) if contract else None,
+                "exchange": getattr(contract, "exchange", None) if contract else None,
+                "con_id": getattr(contract, "conId", None) if contract else None,
+                "local_symbol": getattr(contract, "localSymbol", None) if contract else None,
+                "last_trade_date": (
+                    getattr(contract, "lastTradeDateOrContractMonth", None)
+                    if contract
+                    else None
+                ),
+                "strike": _safe_float(getattr(contract, "strike", None)) if contract else None,
+                "right": getattr(contract, "right", None) if contract else None,
+                "multiplier": getattr(contract, "multiplier", None) if contract else None,
+                "position": _safe_float(getattr(item, "position", None)),
+                "avg_cost": _safe_float(getattr(item, "averageCost", None)),
+                "market_price": _safe_float(getattr(item, "marketPrice", None)),
+                "market_value": _safe_float(getattr(item, "marketValue", None)),
+                "unrealized_pnl": _safe_float(getattr(item, "unrealizedPNL", None)),
+                "realized_pnl": _safe_float(getattr(item, "realizedPNL", None)),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=_PORTFOLIO_COLUMNS)
+    frame = pd.DataFrame(rows, columns=_PORTFOLIO_COLUMNS)
+    return frame.sort_values(["account", "symbol"], na_position="last").reset_index(drop=True)
+
+
+def fetch_cash_balances(ib, account_id: str | None = None) -> dict[str, float]:
+    """Fetch per-currency cash balances from accountValues (CashBalance tag)."""
+    account_values = list(ib.accountValues(account=account_id) or [])
+    if not account_values:
+        ib.reqAccountUpdates(account=account_id or "")
+        account_values = list(ib.accountValues(account=account_id) or [])
+
+    balances: dict[str, float] = {}
+    for av in account_values:
+        if account_id and getattr(av, "account", None) not in (None, "", account_id):
+            continue
+        if getattr(av, "tag", None) != "CashBalance":
+            continue
+        currency = getattr(av, "currency", None)
+        if not currency or currency == "BASE":
+            continue
+        value = _safe_float(getattr(av, "value", None))
+        if value is not None:
+            balances[str(currency)] = value
+
+    return balances
+
+
 def fetch_account_summary(ib, account_id: str | None = None) -> dict[str, float]:
     """Fetch account summary values with USD-only tag normalization."""
     account_values = list(ib.accountValues(account=account_id) or [])
@@ -128,8 +217,8 @@ def fetch_pnl(
     ib,
     account_id: str,
     *,
-    timeout_seconds: float = 5.0,
-    poll_interval: float = 0.1,
+    timeout_seconds: float = IBKR_PNL_TIMEOUT,
+    poll_interval: float = IBKR_PNL_POLL_INTERVAL,
 ) -> dict[str, float | str | None]:
     """Fetch account-level PnL via streaming subscription with timeout polling."""
     pnl_obj = ib.reqPnL(account_id, modelCode="")
@@ -158,8 +247,8 @@ def fetch_pnl_single(
     account_id: str,
     con_id: int,
     *,
-    timeout_seconds: float = 5.0,
-    poll_interval: float = 0.1,
+    timeout_seconds: float = IBKR_PNL_TIMEOUT,
+    poll_interval: float = IBKR_PNL_POLL_INTERVAL,
 ) -> dict[str, float | int | str | None]:
     """Fetch contract-level PnL via streaming subscription with timeout polling."""
     pnl_obj = ib.reqPnLSingle(account_id, modelCode="", conId=int(con_id))

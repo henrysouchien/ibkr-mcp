@@ -10,6 +10,7 @@ import sys
 _real_stdout = sys.stdout
 sys.stdout = sys.stderr
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -18,8 +19,8 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 _pkg_dir = Path(__file__).resolve().parent
-load_dotenv(_pkg_dir / ".env", override=True)
-load_dotenv(_pkg_dir.parent / ".env", override=True)
+load_dotenv(_pkg_dir / ".env", override=False)
+load_dotenv(_pkg_dir.parent / ".env", override=False)
 
 # Restore stdout for MCP transport.
 sys.stdout = _real_stdout
@@ -39,26 +40,79 @@ def _with_stderr_stdout(fn, *args, **kwargs):
         sys.stdout = saved
 
 
+def _error_str(exc: Exception) -> str:
+    """Format exception with type name fallback for empty messages."""
+    msg = str(exc)
+    return msg if msg else type(exc).__name__
+
+
+def parse_list(value: Any, *, coerce=str) -> list | None:
+    """Parse MCP list params that may arrive as JSON or comma-separated strings."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [coerce(v) for v in value]
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    else:
+        if isinstance(parsed, list):
+            return [coerce(v) for v in parsed]
+        raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
+
+    return [coerce(v.strip()) for v in text.split(",") if v.strip()]
+
+
+def parse_json_list(value: Any) -> list | None:
+    """Parse list-of-dict MCP params that may arrive as JSON strings."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    parsed = json.loads(text)
+    if not isinstance(parsed, list):
+        raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
+    return parsed
+
+
 @mcp.tool()
 def get_ibkr_market_data(
-    symbols: list[str],
+    symbols: str,
     instrument_type: Literal["futures", "fx", "bond", "option"],
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     what_to_show: Optional[str] = None,
     contract_identity: Optional[dict] = None,
 ) -> dict:
-    """Fetch historical price series from IBKR Gateway."""
+    """Fetch historical price series from IBKR Gateway.
+
+    symbols accepts a JSON array string or comma-separated symbols.
+    """
 
     def _impl() -> dict:
         from .client import IBKRClient
+
+        parsed_symbols = parse_list(symbols) or []
+        if not parsed_symbols:
+            raise ValueError("symbols is required")
 
         client = IBKRClient()
         end_dt = end_date or datetime.now().strftime("%Y-%m-%d")
         start_dt = start_date or (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
 
         results: dict[str, Any] = {}
-        for sym in symbols:
+        for sym in parsed_symbols:
             series = client.fetch_series(
                 symbol=sym.upper(),
                 instrument_type=instrument_type,
@@ -82,7 +136,7 @@ def get_ibkr_market_data(
     try:
         return _with_stderr_stdout(_impl)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": _error_str(exc)}
 
 
 @mcp.tool()
@@ -111,7 +165,7 @@ def get_ibkr_positions(
     try:
         return _with_stderr_stdout(_impl)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": _error_str(exc)}
 
 
 @mcp.tool()
@@ -128,7 +182,7 @@ def get_ibkr_account(account_id: Optional[str] = None) -> dict:
     try:
         return _with_stderr_stdout(_impl)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": _error_str(exc)}
 
 
 @mcp.tool()
@@ -160,17 +214,20 @@ def get_ibkr_contract(
     try:
         return _with_stderr_stdout(_impl)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": _error_str(exc)}
 
 
 @mcp.tool()
 def get_ibkr_option_prices(
     symbol: str,
     expiry: str,
-    strikes: list[float],
+    strikes: str,
     right: str = "P",
 ) -> dict:
-    """Snapshot bid/ask/greeks for multiple option strikes."""
+    """Snapshot bid/ask/greeks for multiple option strikes.
+
+    strikes accepts a JSON array string or comma-separated values.
+    """
 
     def _impl() -> dict:
         from ib_async import Option
@@ -182,15 +239,19 @@ def get_ibkr_option_prices(
         if normalized_right not in {"P", "C"}:
             raise ValueError("right must be 'P' or 'C'")
 
+        parsed_strikes = parse_list(strikes, coerce=float) or []
+        if not parsed_strikes:
+            raise ValueError("strikes is required")
+
         client = IBKRClient()
         contracts = [
             Option(normalized_symbol, expiry, float(strike), normalized_right, "SMART")
-            for strike in strikes
+            for strike in parsed_strikes
         ]
         snapshots = client.fetch_snapshot(contracts=contracts)
 
         prices: dict[float, dict[str, Any]] = {}
-        for idx, strike in enumerate(strikes):
+        for idx, strike in enumerate(parsed_strikes):
             strike_key = float(strike)
             prices[strike_key] = snapshots[idx] if idx < len(snapshots) else {"error": "timeout"}
 
@@ -205,7 +266,7 @@ def get_ibkr_option_prices(
     try:
         return _with_stderr_stdout(_impl)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": _error_str(exc)}
 
 
 @mcp.tool()
@@ -250,7 +311,23 @@ def get_ibkr_snapshot(
     try:
         return _with_stderr_stdout(_impl)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": _error_str(exc)}
+
+
+@mcp.tool()
+def get_ibkr_status() -> dict:
+    """Return IBKR Gateway connection status for diagnostics."""
+
+    def _impl() -> dict:
+        from .client import IBKRClient
+
+        client = IBKRClient()
+        return {"status": "success", **client.get_connection_status()}
+
+    try:
+        return _with_stderr_stdout(_impl)
+    except Exception as exc:
+        return {"status": "error", "error": _error_str(exc)}
 
 
 def _kill_previous_instance() -> None:

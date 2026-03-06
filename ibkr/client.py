@@ -2,8 +2,9 @@
 
 Agent orientation:
     Canonical object interface for IBKR operations used by higher layers.
-    This facade routes account/metadata calls through the persistent connection
-    manager and market-data calls through ``IBKRMarketDataClient``.
+    This facade routes account/metadata calls through the connection manager
+    (ephemeral or persistent by mode) and market-data calls through
+    ``IBKRMarketDataClient``.
 """
 
 from __future__ import annotations
@@ -14,8 +15,15 @@ from typing import Any
 
 import pandas as pd
 
-from .config import IBKR_AUTHORIZED_ACCOUNTS
-from .account import fetch_account_summary, fetch_pnl, fetch_pnl_single, fetch_positions
+from .config import IBKR_AUTHORIZED_ACCOUNTS, IBKR_FUTURES_CURVE_TIMEOUT
+from .account import (
+    fetch_account_summary,
+    fetch_cash_balances,
+    fetch_pnl,
+    fetch_pnl_single,
+    fetch_portfolio_items,
+    fetch_positions,
+)
 from .capabilities import get_capability, list_capabilities
 from .connection import IBKRConnectionManager
 from .exceptions import IBKRAccountError
@@ -27,7 +35,7 @@ from .metadata import fetch_contract_details, fetch_option_chain
 class IBKRClient:
     """Unified IBKR API client.
 
-    - Account and metadata requests use persistent IBKRConnectionManager
+    - Account and metadata requests use IBKRConnectionManager
     - Market data requests delegate to IBKRMarketDataClient
 
     Primary flow:
@@ -45,9 +53,10 @@ class IBKRClient:
         self._market_data = IBKRMarketDataClient(host=host, port=port, client_id=client_id)
         self._conn_manager = IBKRConnectionManager()
 
-    def _get_account_ib(self):
-        """Get the shared IB connection for account/metadata operations."""
-        return self._conn_manager.ensure_connected()
+    def get_connection_status(self) -> dict[str, Any]:
+        """Return diagnostic dict describing current connection state."""
+        with ibkr_shared_lock:
+            return self._conn_manager.get_connection_status()
 
     def _resolve_account_id(self, ib, account_id: str | None = None) -> str:
         """Resolve account_id with authorization filtering and ambiguity checks."""
@@ -99,29 +108,55 @@ class IBKRClient:
     def fetch_snapshot(self, **kwargs) -> list[dict[str, Any]]:
         return self._market_data.fetch_snapshot(**kwargs)
 
+    def get_futures_curve_snapshot(
+        self,
+        symbol: str,
+        timeout: float = IBKR_FUTURES_CURVE_TIMEOUT,
+    ) -> list[dict[str, Any]]:
+        """Snapshot prices for all active contract months."""
+        return self._market_data.fetch_futures_curve_snapshot(symbol, timeout=timeout)
+
     def get_positions(self, account_id: str | None = None) -> pd.DataFrame:
         with ibkr_shared_lock:
-            ib = self._get_account_ib()
-            resolved_account = self._resolve_account_id(ib, account_id)
-            return fetch_positions(ib, account_id=resolved_account)
+            with self._conn_manager.connection() as ib:
+                resolved_account = self._resolve_account_id(ib, account_id)
+                return fetch_positions(ib, account_id=resolved_account)
+
+    def get_portfolio_with_cash(
+        self,
+        account_id: str | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, float]]:
+        """Fetch portfolio items and cash balances in one connection session."""
+        with ibkr_shared_lock:
+            with self._conn_manager.connection() as ib:
+                resolved_account = self._resolve_account_id(ib, account_id)
+                portfolio_df = fetch_portfolio_items(ib, account_id=resolved_account)
+                cash_balances = fetch_cash_balances(ib, account_id=resolved_account)
+                return portfolio_df, cash_balances
+
+    def get_managed_accounts(self) -> list[str]:
+        """Return managed account IDs discovered from Gateway."""
+        with ibkr_shared_lock:
+            with self._conn_manager.connection() as ib:
+                return list(ib.managedAccounts() or [])
 
     def get_account_summary(self, account_id: str | None = None) -> dict[str, float]:
         with ibkr_shared_lock:
-            ib = self._get_account_ib()
-            resolved_account = self._resolve_account_id(ib, account_id)
-            return fetch_account_summary(ib, account_id=resolved_account)
+            with self._conn_manager.connection() as ib:
+                resolved_account = self._resolve_account_id(ib, account_id)
+                return fetch_account_summary(ib, account_id=resolved_account)
 
     def get_pnl(self, account_id: str | None = None) -> dict[str, Any]:
         with ibkr_shared_lock:
-            ib = self._get_account_ib()
-            resolved_account = self._resolve_account_id(ib, account_id)
-            return fetch_pnl(ib, account_id=resolved_account)
+            with self._conn_manager.connection() as ib:
+                resolved_account = self._resolve_account_id(ib, account_id)
+                return fetch_pnl(ib, account_id=resolved_account)
 
     def get_pnl_single(self, account_id: str | None, con_id: int) -> dict[str, Any]:
         with ibkr_shared_lock:
-            ib = self._get_account_ib()
-            resolved_account = self._resolve_account_id(ib, account_id)
-            return fetch_pnl_single(ib, account_id=resolved_account, con_id=int(con_id))
+            with self._conn_manager.connection() as ib:
+                resolved_account = self._resolve_account_id(ib, account_id)
+                return fetch_pnl_single(ib, account_id=resolved_account, con_id=int(con_id))
 
     def get_contract_details(
         self,
@@ -131,14 +166,22 @@ class IBKRClient:
         currency: str = "USD",
     ) -> list[dict[str, Any]]:
         with ibkr_shared_lock:
-            ib = self._get_account_ib()
-            return fetch_contract_details(
-                ib,
-                symbol=symbol,
-                sec_type=sec_type,
-                exchange=exchange,
-                currency=currency,
-            )
+            with self._conn_manager.connection() as ib:
+                return fetch_contract_details(
+                    ib,
+                    symbol=symbol,
+                    sec_type=sec_type,
+                    exchange=exchange,
+                    currency=currency,
+                )
+
+    def get_futures_months(self, symbol: str) -> list[dict[str, Any]]:
+        """Discover available contract months for a futures root."""
+        from .metadata import fetch_futures_months
+
+        with ibkr_shared_lock:
+            with self._conn_manager.connection() as ib:
+                return fetch_futures_months(ib, symbol)
 
     def get_option_chain(
         self,
@@ -147,8 +190,8 @@ class IBKRClient:
         exchange: str = "SMART",
     ) -> dict[str, Any]:
         with ibkr_shared_lock:
-            ib = self._get_account_ib()
-            return fetch_option_chain(ib, symbol=symbol, sec_type=sec_type, exchange=exchange)
+            with self._conn_manager.connection() as ib:
+                return fetch_option_chain(ib, symbol=symbol, sec_type=sec_type, exchange=exchange)
 
     def list_capabilities(self, category: str | None = None) -> list[dict[str, Any]]:
         return [asdict(cap) for cap in list_capabilities(category=category)]

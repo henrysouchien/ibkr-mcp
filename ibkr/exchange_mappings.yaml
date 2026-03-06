@@ -12,41 +12,6 @@ ibkr_exchange_to_mic:
   # Listing exchanges (used as fallback when execution venue is unrecognized)
   LSE: XLON
 
-# IBKR futures root symbol -> FMP commodity symbol
-ibkr_futures_to_fmp:
-  # Index Futures
-  ES: ESUSD
-  MES: ESUSD
-  NQ: NQUSD
-  MNQ: NQUSD
-  YM: YMUSD
-  RTY: RTYUSD
-  # International Index Futures
-  NKD: "^N225"
-  MNK: "^N225"
-  NIY: "^N225"
-  IBV: "^BVSP"
-  ESTX50: "^STOXX50E"
-  DAX: "^GDAXI"
-  Z: "^FTSE"
-  HSI: "^HSI"
-  # Metals
-  GC: GCUSD
-  MGC: MGCUSD
-  SI: SIUSD
-  HG: HGUSD
-  PL: PLUSD
-  PA: PAUSD
-  # Energy
-  CL: CLUSD
-  BZ: BZUSD
-  NG: NGUSD
-  # Fixed Income
-  ZB: ZBUSD
-  ZN: ZNUSD
-  ZF: ZFUSD
-  ZT: ZTUSD
-
 # IBKR exchange routing for ContFuture qualification
 ibkr_futures_exchanges:
   ES: { exchange: CME, currency: USD }
@@ -58,7 +23,6 @@ ibkr_futures_exchanges:
   NKD: { exchange: CME, currency: USD }
   MNK: { exchange: CME, currency: USD }
   NIY: { exchange: CME, currency: JPY }
-  IBV: { exchange: CME, currency: USD }
   ESTX50: { exchange: EUREX, currency: EUR }
   DAX: { exchange: EUREX, currency: EUR }
   Z: { exchange: ICEEU, currency: GBP }

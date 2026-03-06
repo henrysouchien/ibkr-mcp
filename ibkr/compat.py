@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import pandas as pd
 import yaml
@@ -27,7 +27,8 @@ from .exceptions import (
     IBKRNoDataError,
     IBKRTimeoutError,
 )
-from ._logging import portfolio_logger
+from ._logging import logger
+from .config import IBKR_FUTURES_CURVE_TIMEOUT
 
 IBKRMarketDataClient = None
 
@@ -40,15 +41,19 @@ def _load_ibkr_exchange_mappings() -> dict[str, Any]:
 
 
 def get_ibkr_futures_fmp_map() -> dict[str, str]:
-    """Load IBKR futures-root -> FMP symbol mappings."""
-    raw_map = _load_ibkr_exchange_mappings().get("ibkr_futures_to_fmp", {})
+    """Return IBKR-routable futures-root -> FMP symbol mappings."""
+    from brokerage.futures import load_contract_specs
+
+    ibkr_routing = get_ibkr_futures_exchanges()
+    all_specs = load_contract_specs()
+
     out: dict[str, str] = {}
-    if isinstance(raw_map, dict):
-        for symbol, mapped in raw_map.items():
-            key = str(symbol or "").strip().upper()
-            val = str(mapped or "").strip().upper()
-            if key and val:
-                out[key] = val
+    for symbol, spec in all_specs.items():
+        if symbol not in ibkr_routing:
+            continue
+        mapped = str(spec.fmp_symbol or "").strip().upper()
+        if mapped:
+            out[symbol] = mapped
     return out
 
 
@@ -68,12 +73,59 @@ def get_ibkr_futures_exchanges() -> dict[str, dict[str, str]]:
     return out
 
 
+def get_ibkr_futures_contract_meta() -> dict[str, dict[str, Any]]:
+    """Return IBKR-routable futures metadata from the canonical futures catalog."""
+    from brokerage.futures import load_contract_specs
+
+    ibkr_routing = get_ibkr_futures_exchanges()
+    all_specs = load_contract_specs()
+
+    out: dict[str, dict[str, Any]] = {}
+    for symbol, spec in all_specs.items():
+        if symbol not in ibkr_routing:
+            continue
+
+        identity = spec.to_contract_identity()
+        # IBKR routing values are authoritative inside IBKR contexts.
+        identity["exchange"] = ibkr_routing[symbol]["exchange"]
+        identity["currency"] = ibkr_routing[symbol]["currency"]
+        out[symbol] = identity
+    return out
+
+
+def get_futures_contract_meta(symbol: str) -> Optional[dict[str, Any]]:
+    """Return full contract metadata for an IBKR futures root symbol."""
+    return get_ibkr_futures_contract_meta().get(str(symbol or "").strip().upper())
+
+
 def get_futures_currency(symbol: str) -> str:
     """Return settlement currency for a futures root symbol."""
     key = str(symbol or "").strip().upper()
     if not key:
         return "USD"
-    return get_ibkr_futures_exchanges().get(key, {}).get("currency", "USD")
+    from brokerage.futures import get_contract_spec
+
+    spec = get_contract_spec(key)
+    return spec.currency if spec else "USD"
+
+
+def get_futures_months(symbol: str) -> list[dict[str, Any]]:
+    """Discover available contract months for a futures root symbol."""
+    from .client import IBKRClient
+
+    client = IBKRClient()
+    return client.get_futures_months(symbol)
+
+
+def get_futures_curve_snapshot(
+    symbol: str,
+    timeout: float = IBKR_FUTURES_CURVE_TIMEOUT,
+) -> list[dict[str, Any]]:
+    """Snapshot prices for all active contract months of a futures root symbol."""
+    from .client import IBKRClient
+
+    client = IBKRClient()
+    return client.get_futures_curve_snapshot(symbol, timeout=timeout)
 
 
 def fetch_ibkr_monthly_close(
@@ -97,7 +149,7 @@ def fetch_ibkr_monthly_close(
         client = client_cls()
         return client.fetch_monthly_close_futures(symbol, start_date, end_date)
     except Exception as exc:
-        portfolio_logger.warning("IBKR futures fetch failed for %s: %s", symbol, exc)
+        logger.warning("IBKR futures fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
 
 
@@ -116,7 +168,7 @@ def fetch_ibkr_daily_close_futures(
         client = client_cls()
         return client.fetch_daily_close_futures(symbol, start_date, end_date)
     except Exception as exc:
-        portfolio_logger.warning("IBKR daily futures fetch failed for %s: %s", symbol, exc)
+        logger.warning("IBKR daily futures fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
 
 
@@ -135,7 +187,7 @@ def fetch_ibkr_fx_monthly_close(
         client = client_cls()
         return client.fetch_monthly_close_fx(symbol, start_date, end_date)
     except Exception as exc:
-        portfolio_logger.warning("IBKR FX fetch failed for %s: %s", symbol, exc)
+        logger.warning("IBKR FX fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
 
 
@@ -160,7 +212,7 @@ def fetch_ibkr_bond_monthly_close(
             contract_identity=contract_identity,
         )
     except Exception as exc:
-        portfolio_logger.warning("IBKR bond fetch failed for %s: %s", symbol, exc)
+        logger.warning("IBKR bond fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
 
 
@@ -185,7 +237,7 @@ def fetch_ibkr_option_monthly_mark(
             contract_identity=contract_identity,
         )
     except Exception as exc:
-        portfolio_logger.warning("IBKR option fetch failed for %s: %s", symbol, exc)
+        logger.warning("IBKR option fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
 
 
@@ -234,7 +286,11 @@ __all__ = [
     "fetch_ibkr_flex_payload",
     "get_ibkr_futures_fmp_map",
     "get_ibkr_futures_exchanges",
+    "get_ibkr_futures_contract_meta",
+    "get_futures_contract_meta",
     "get_futures_currency",
+    "get_futures_months",
+    "get_futures_curve_snapshot",
     "IBKRDataError",
     "IBKRConnectionError",
     "IBKRContractError",

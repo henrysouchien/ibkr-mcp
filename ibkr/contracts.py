@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml
 
-from ._logging import portfolio_logger
+from ._logging import logger
 from ._types import InstrumentType, coerce_instrument_type
 
 from .exceptions import IBKRContractError
@@ -18,6 +18,7 @@ from .exceptions import IBKRContractError
 Contract = Any
 
 _FX_PAIR_RE = re.compile(r"^[A-Z]{3}[./]?[A-Z]{3}$")
+_CONTRACT_MONTH_RE = re.compile(r"^\d{6}(\d{2})?$")
 
 
 @lru_cache(maxsize=1)
@@ -27,9 +28,9 @@ def _load_ibkr_exchange_mappings() -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except FileNotFoundError:
-        portfolio_logger.warning("IBKR exchange_mappings.yaml not found at %s", path)
+        logger.warning("IBKR exchange_mappings.yaml not found at %s", path)
     except Exception as exc:
-        portfolio_logger.warning("Failed to load IBKR exchange mappings from %s: %s", path, exc)
+        logger.warning("Failed to load IBKR exchange mappings from %s: %s", path, exc)
     return {}
 
 
@@ -50,13 +51,34 @@ def _futures_exchange_meta(symbol: str) -> tuple[str, str]:
     return exchange, currency
 
 
-def resolve_futures_contract(symbol: str) -> Contract:
+def resolve_futures_contract(symbol: str, contract_month: str | None = None) -> Contract:
     """Resolve a futures root symbol into an IBKR continuous futures contract."""
-    from ib_async import ContFuture
+    try:
+        from ib_async import ContFuture, Future
+    except ImportError:
+        from ib_async import ContFuture
+
+        Future = None
 
     sym = str(symbol or "").strip().upper()
     exchange, currency = _futures_exchange_meta(sym)
-    return ContFuture(symbol=sym, exchange=exchange, currency=currency)
+    if contract_month is None:
+        return ContFuture(symbol=sym, exchange=exchange, currency=currency)
+
+    if Future is None:
+        from ib_async import Future
+
+    cm = str(contract_month).strip()
+    if not _CONTRACT_MONTH_RE.match(cm):
+        raise IBKRContractError(
+            f"Invalid futures contract_month '{contract_month}'; expected YYYYMM or YYYYMMDD"
+        )
+    return Future(
+        symbol=sym,
+        lastTradeDateOrContractMonth=cm,
+        exchange=exchange,
+        currency=currency,
+    )
 
 
 def _normalize_fx_pair(symbol: str) -> str:
@@ -100,21 +122,41 @@ def _coerce_con_id(contract_identity: dict[str, Any] | None) -> int | None:
         raise IBKRContractError(f"Invalid con_id '{con_id}' in contract_identity") from None
 
 
-def resolve_bond_contract(symbol: str, contract_identity: dict[str, Any] | None = None) -> Contract:
-    """Resolve a bond contract. v1 requires IBKR conId."""
+def resolve_bond_contract(
+    symbol: str,
+    contract_identity: dict[str, Any] | None = None,
+) -> Contract:
+    """Resolve a bond contract. Tries con_id first, then CUSIP."""
     del symbol
-    con_id = _coerce_con_id(contract_identity)
-    if con_id is None:
-        raise IBKRContractError("Bond pricing requires contract_identity.con_id")
-
     try:
+        con_id = _coerce_con_id(contract_identity)
+    except IBKRContractError:
+        con_id = None  # allow CUSIP fallback when con_id is invalid
+
+    if con_id is not None:
+        try:
+            from ib_async import Bond
+
+            return Bond(conId=con_id)
+        except Exception:
+            from ib_async import Contract
+
+            return Contract(conId=con_id, secType="BOND")
+
+    identity = contract_identity if isinstance(contract_identity, dict) else {}
+    cusip = identity.get("cusip")
+    if isinstance(cusip, str) and cusip.strip():
         from ib_async import Bond
 
-        return Bond(conId=con_id)
-    except Exception:
-        from ib_async import Contract
+        bond = Bond()
+        bond.secIdType = "CUSIP"
+        bond.secId = cusip.strip()
+        bond.currency = str(identity.get("currency") or "USD").upper()
+        return bond
 
-        return Contract(conId=con_id, secType="BOND")
+    raise IBKRContractError(
+        "Bond pricing requires contract_identity with con_id or cusip"
+    )
 
 
 _OCC_OPTION_RE = re.compile(r"^([A-Z]{1,6})\s*\d{6,8}[CP]\d+$")
@@ -187,7 +229,8 @@ def resolve_contract(
 
     normalized = coerce_instrument_type(instrument_type, default="unknown")
     if normalized == "futures":
-        return resolve_futures_contract(symbol)
+        month = (contract_identity or {}).get("contract_month")
+        return resolve_futures_contract(symbol, contract_month=month)
     if normalized == "fx_artifact":
         return resolve_fx_contract(symbol)
     if normalized == "bond":

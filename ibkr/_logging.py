@@ -1,23 +1,42 @@
-"""IBKR package-local logging shims with monorepo fallback behavior."""
+"""IBKR package logging."""
 
 from __future__ import annotations
 
 import logging
 import sys
+import time
 
+logger = logging.getLogger("ibkr")
 
-def _make_fallback_logger(name: str) -> logging.Logger:
-    logger = logging.getLogger(f"ibkr.{name}")
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
-        logger.addHandler(handler)
+# Ensure at least stderr output when no root handlers are configured
+# (standalone/CLI usage outside the monorepo).
+if not logging.root.handlers and not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+    logger.addHandler(_handler)
     logger.setLevel(logging.INFO)
-    return logger
 
 
-try:
-    from utils.logging import portfolio_logger, trading_logger
-except Exception:
-    portfolio_logger = _make_fallback_logger("portfolio")
-    trading_logger = _make_fallback_logger("trading")
+def log_event(logger: logging.Logger, level: int, event: str, msg: str = "", **fields) -> None:
+    """Log with structured key=value fields.
+
+    Output: [ibkr.connect] Connected to gateway client_id=20 elapsed_ms=142
+    """
+    parts = [f"[ibkr.{event}]"]
+    if msg:
+        parts.append(msg)
+    for key, value in fields.items():
+        if value is not None:
+            parts.append(f"{key}={value}")
+    logger.log(level, " ".join(parts))
+
+
+class TimingContext:
+    """Context manager for elapsed time measurement."""
+
+    def __enter__(self):
+        self.start = time.monotonic()
+        return self
+
+    def __exit__(self, *args):
+        self.elapsed_ms = round((time.monotonic() - self.start) * 1000, 1)
