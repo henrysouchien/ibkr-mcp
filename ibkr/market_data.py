@@ -629,7 +629,7 @@ class IBKRMarketDataClient:
                 # Detect if any qualified contract is an option — use longer
                 # timeout so IBKR has time to compute model Greeks.
                 has_options = any(
-                    str(getattr(c, "secType", "") or "").upper() == "OPT"
+                    str(getattr(c, "secType", "") or "").upper() in ("OPT", "FOP")
                     for c in qualified_by_index.values()
                 )
                 effective_timeout = option_timeout_seconds if has_options else timeout_seconds
@@ -643,7 +643,7 @@ class IBKRMarketDataClient:
 
                 for idx, qualified_contract in qualified_by_index.items():
                     sec_type = str(getattr(qualified_contract, "secType", "") or "").upper()
-                    generic_ticks = "100,101,106" if sec_type == "OPT" else ""
+                    generic_ticks = "100,101,106" if sec_type in ("OPT", "FOP") else ""
                     try:
                         tickers_by_index[idx] = ib.reqMktData(
                             qualified_contract,
@@ -764,7 +764,7 @@ class IBKRMarketDataClient:
             sec_type = str(getattr(contract_for_fields, "secType", "") or "").upper()
             right = str(getattr(contract_for_fields, "right", "") or "").upper()
 
-            if sec_type == "OPT":
+            if sec_type in ("OPT", "FOP"):
                 volume = self._value_for_option_side(
                     ticker,
                     right=right,

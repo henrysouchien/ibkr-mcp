@@ -51,7 +51,7 @@ class IBKRClient:
         client_id: int | None = None,
     ) -> None:
         self._market_data = IBKRMarketDataClient(host=host, port=port, client_id=client_id)
-        self._conn_manager = IBKRConnectionManager()
+        self._conn_manager = IBKRConnectionManager(client_id=client_id)
 
     def get_connection_status(self) -> dict[str, Any]:
         """Return diagnostic dict describing current connection state."""

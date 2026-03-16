@@ -29,7 +29,7 @@ Source = "https://github.com/henrysouchien/ibkr-mcp"
 ibkr-mcp = "ibkr.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["ibkr"]
+packages = ["ibkr", "ibkr_mcp"]
 
 [tool.hatch.build.targets.sdist]
-include = ["ibkr/", "pyproject.toml", "README.md", "LICENSE"]
+include = ["ibkr/", "ibkr_mcp/", "pyproject.toml", "README.md", "LICENSE"]

@@ -59,6 +59,8 @@ def _normalize_contract_detail(contract_detail) -> dict[str, Any]:
         "primary_exchange": getattr(contract, "primaryExchange", None) if contract else None,
         "currency": getattr(contract, "currency", None) if contract else None,
         "multiplier": getattr(contract, "multiplier", None) if contract else None,
+        "strike": float(getattr(contract, "strike", 0)) if contract else None,
+        "right": str(getattr(contract, "right", "")) if contract else None,
         "min_tick": _safe_float(getattr(contract_detail, "minTick", None)),
         "trading_class": getattr(contract, "tradingClass", None) if contract else None,
         "valid_exchanges": valid_exchanges,
