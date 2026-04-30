@@ -14,7 +14,10 @@ import threading
 import time
 from typing import Any, List, Optional
 
+from app_platform.api_budget import BudgetExceededError
+
 from ._logging import log_event, logger, TimingContext
+from ._budget import guard_ib_call
 from .config import (
     IBKR_CLIENT_ID,
     IBKR_CONNECTION_MODE,
@@ -24,15 +27,13 @@ from .config import (
     IBKR_MAX_RECONNECT_ATTEMPTS,
     IBKR_READONLY,
     IBKR_RECONNECT_DELAY,
+    IBKR_REQUEST_TIMEOUT,
     IBKR_TIMEOUT,
 )
 
-try:
-    import nest_asyncio
+from .asyncio_compat import apply_nest_asyncio_if_running_loop
 
-    nest_asyncio.apply()
-except Exception:
-    pass
+apply_nest_asyncio_if_running_loop()
 
 
 class IBKRConnectionManager:
@@ -78,21 +79,41 @@ class IBKRConnectionManager:
         self._reconnecting = False
         self._manual_disconnect = False
 
-    def _do_connect(self, attach_events: bool = True):
+    @staticmethod
+    def _budget_kwargs(budget_user_id: int | None) -> dict[str, int]:
+        if budget_user_id is None:
+            return {}
+        return {"budget_user_id": budget_user_id}
+
+    def _do_connect(
+        self,
+        attach_events: bool = True,
+        *,
+        budget_user_id: int | None = None,
+    ):
         """Create and connect a fresh IB instance without storing to self._ib."""
+        from .asyncio_compat import ensure_event_loop
+
+        ensure_event_loop()
         from ib_async import IB
 
         ib = IB()
         if attach_events:
             ib.disconnectedEvent += self._on_disconnect
         try:
-            ib.connect(
-                host=self._host,
-                port=self._port,
-                clientId=self._client_id,
-                timeout=self._timeout,
-                readonly=self._readonly,
+            guard_ib_call(
+                operation="connect",
+                fn=ib.connect,
+                kwargs={
+                    "host": self._host,
+                    "port": self._port,
+                    "clientId": self._client_id,
+                    "timeout": self._timeout,
+                    "readonly": self._readonly,
+                },
+                budget_user_id=budget_user_id,
             )
+            ib.RequestTimeout = IBKR_REQUEST_TIMEOUT
             return ib
         except Exception:
             if attach_events:
@@ -106,7 +127,12 @@ class IBKRConnectionManager:
                 pass
             raise
 
-    def connect(self, max_attempts: int | None = None):
+    def connect(
+        self,
+        max_attempts: int | None = None,
+        *,
+        budget_user_id: int | None = None,
+    ):
         """Connect to IB Gateway. Thread-safe and idempotent.
 
         Retries up to *max_attempts* times (default from config) with linear
@@ -138,7 +164,10 @@ class IBKRConnectionManager:
 
                 try:
                     with TimingContext() as tc:
-                        ib = self._do_connect(attach_events=True)
+                        ib = self._do_connect(
+                            attach_events=True,
+                            **self._budget_kwargs(budget_user_id),
+                        )
                     self._ib = ib
                     self._managed_accounts = list(ib.managedAccounts() or [])
                     log_event(
@@ -148,6 +177,8 @@ class IBKRConnectionManager:
                         elapsed_ms=tc.elapsed_ms,
                     )
                     return ib
+                except BudgetExceededError:
+                    raise
                 except Exception as exc:
                     last_exc = exc
                     if attempt < effective_attempts:
@@ -166,10 +197,10 @@ class IBKRConnectionManager:
             raise last_exc  # type: ignore[misc]
 
     @contextmanager
-    def connection(self):
+    def connection(self, *, budget_user_id: int | None = None):
         """Yield a connected IB instance based on configured connection mode."""
         if IBKR_CONNECTION_MODE == "persistent":
-            yield self.ensure_connected()
+            yield self.ensure_connected(**self._budget_kwargs(budget_user_id))
             return
 
         last_exc: Exception | None = None
@@ -186,13 +217,18 @@ class IBKRConnectionManager:
                 time.sleep(delay)
             try:
                 with TimingContext() as tc:
-                    ib = self._do_connect(attach_events=False)
+                    ib = self._do_connect(
+                        attach_events=False,
+                        **self._budget_kwargs(budget_user_id),
+                    )
                 log_event(
                     logger, logging.INFO, "connect.ephemeral",
                     client_id=self._client_id,
                     elapsed_ms=tc.elapsed_ms,
                 )
                 break
+            except BudgetExceededError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 if ib is not None:
@@ -239,15 +275,15 @@ class IBKRConnectionManager:
                 self._managed_accounts = []
                 self._manual_disconnect = False
 
-    def ensure_connected(self):
+    def ensure_connected(self, *, budget_user_id: int | None = None):
         """Return connected IB instance, reconnecting as needed."""
         if self._ib is not None and self._ib.isConnected():
             return self._ib
-        return self.connect()
+        return self.connect(**self._budget_kwargs(budget_user_id))
 
-    def get_ib(self):
+    def get_ib(self, *, budget_user_id: int | None = None):
         """Alias for ensure_connected()."""
-        return self.ensure_connected()
+        return self.ensure_connected(**self._budget_kwargs(budget_user_id))
 
     @property
     def managed_accounts(self) -> list[str]:
@@ -258,10 +294,10 @@ class IBKRConnectionManager:
     def is_connected(self) -> bool:
         return self._ib is not None and self._ib.isConnected()
 
-    def get_connection_status(self) -> dict[str, Any]:
+    def get_connection_status(self, *, budget_user_id: int | None = None) -> dict[str, Any]:
         """Return diagnostic dict describing current connection state."""
         if IBKR_CONNECTION_MODE == "ephemeral" and not self.is_connected:
-            probe = self.probe_connection()
+            probe = self.probe_connection(**self._budget_kwargs(budget_user_id))
             return {
                 "connected": probe["reachable"],
                 "host": self._host,
@@ -296,16 +332,21 @@ class IBKRConnectionManager:
             },
         }
 
-    def probe_connection(self) -> dict[str, Any]:
+    def probe_connection(self, *, budget_user_id: int | None = None) -> dict[str, Any]:
         """Probe whether IB Gateway is reachable via connect + disconnect."""
         if self._ib is not None and self._ib.isConnected():
             return {"reachable": True, "managed_accounts": list(self._managed_accounts)}
 
         ib = None
         try:
-            ib = self._do_connect(attach_events=False)
+            ib = self._do_connect(
+                attach_events=False,
+                **self._budget_kwargs(budget_user_id),
+            )
             accounts = list(ib.managedAccounts() or [])
             return {"reachable": True, "managed_accounts": accounts}
+        except BudgetExceededError:
+            raise
         except Exception as e:
             return {"reachable": False, "error": str(e)}
         finally:
@@ -363,3 +404,25 @@ class IBKRConnectionManager:
         finally:
             with self._connect_lock:
                 self._reconnecting = False
+
+
+def probe_ibkr_connection(
+    *,
+    client_id: int | None = None,
+    budget_user_id: int | None = None,
+) -> dict[str, Any]:
+    """Return the current IBKR gateway probe result as a parsed status dict."""
+
+    manager = IBKRConnectionManager() if client_id is None else IBKRConnectionManager(client_id=client_id)
+    if budget_user_id is None:
+        return manager.probe_connection()
+    return manager.probe_connection(budget_user_id=budget_user_id)
+
+
+def get_ibkr_connection_status(*, budget_user_id: int | None = None) -> dict[str, Any]:
+    """Return the current singleton IBKR connection status as a parsed dict."""
+
+    manager = IBKRConnectionManager()
+    if budget_user_id is None:
+        return manager.get_connection_status()
+    return manager.get_connection_status(budget_user_id=budget_user_id)

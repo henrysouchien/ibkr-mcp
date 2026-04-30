@@ -19,8 +19,10 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+from app_platform.api_budget import BudgetExceededError
 
 from ._logging import log_event, logger, TimingContext
+from ._budget import guard_ib_call
 from .config import (
     IBKR_CLIENT_ID,
     IBKR_CONNECT_MAX_ATTEMPTS,
@@ -35,7 +37,8 @@ from .config import (
 )
 
 from .cache import get_cached, put_cache
-from .contracts import resolve_contract
+from .contract_spec import IBKRContractSpec
+from .contracts import resolve_contract, resolve_futures_contract, resolve_option_contract
 from .exceptions import (
     IBKRConnectionError,
     IBKRContractError,
@@ -46,17 +49,12 @@ from .exceptions import (
 from .profiles import InstrumentProfile, get_profile
 from .locks import ibkr_shared_lock
 from .metadata import fetch_futures_months
+from .asyncio_compat import apply_nest_asyncio_if_running_loop
 
 if TYPE_CHECKING:
     from ib_async import Contract
 
-try:
-    import nest_asyncio
-
-    nest_asyncio.apply()
-except Exception:
-    # Safe to continue in test contexts where event loop patching is unavailable.
-    pass
+apply_nest_asyncio_if_running_loop()
 
 
 _ibkr_request_lock = threading.Lock()
@@ -108,19 +106,29 @@ class IBKRMarketDataClient:
         self.client_id = int(client_id if client_id is not None else market_data_client_id)
         self.timeout = int(IBKR_TIMEOUT)
 
-    def _connect_ib(self):
+    def _connect_ib(self, *, budget_user_id: int | None = None):
+        from .asyncio_compat import ensure_event_loop
+
+        ensure_event_loop()
         from ib_async import IB
 
         ib = IB()
         try:
-            ib.connect(
-                host=self.host,
-                port=self.port,
-                clientId=self.client_id,
-                timeout=self.timeout,
-                readonly=True,
+            guard_ib_call(
+                operation="connect",
+                fn=ib.connect,
+                kwargs={
+                    "host": self.host,
+                    "port": self.port,
+                    "clientId": self.client_id,
+                    "timeout": self.timeout,
+                    "readonly": True,
+                },
+                budget_user_id=budget_user_id,
             )
             return ib
+        except BudgetExceededError:
+            raise
         except ConnectionRefusedError as exc:
             raise IBKRConnectionError("IB Gateway not running") from exc
         except Exception as exc:
@@ -138,7 +146,105 @@ class IBKRMarketDataClient:
             return _compute_duration_str(start_ts.to_pydatetime(), _utcnow())
         return _compute_duration_str(start_ts.to_pydatetime(), end_ts.to_pydatetime())
 
-    def _qualify_contract(self, ib, contract):
+    def _coerce_snapshot_contract(self, contract: Any):
+        """Accept raw contracts or lightweight boundary contract specs."""
+        if isinstance(contract, IBKRContractSpec):
+            return self._resolve_spec(contract)
+
+        if isinstance(contract, dict):
+            contract = type("IBKRContractSpec", (), contract)()
+
+        if not getattr(contract, "_ibkr_contract_spec", False):
+            return contract
+
+        sec_type = str(
+            getattr(contract, "secType", None)
+            or getattr(contract, "instrument_type", None)
+            or ""
+        ).strip().upper()
+        symbol = str(getattr(contract, "symbol", "") or "").strip().upper()
+        exchange = str(getattr(contract, "exchange", "SMART") or "SMART").strip().upper()
+        currency = str(getattr(contract, "currency", "USD") or "USD").strip().upper()
+
+        if sec_type == "OPT":
+            contract_identity = {
+                "symbol": symbol,
+                "expiry": getattr(contract, "lastTradeDateOrContractMonth", None),
+                "strike": getattr(contract, "strike", None),
+                "right": getattr(contract, "right", None),
+                "exchange": exchange,
+                "currency": currency,
+                "multiplier": getattr(contract, "multiplier", None),
+                "con_id": getattr(contract, "conId", None),
+            }
+            return resolve_option_contract(symbol, contract_identity=contract_identity)
+
+        if sec_type == "FUT":
+            contract_month = getattr(contract, "lastTradeDateOrContractMonth", None)
+            if exchange == "SMART":
+                return resolve_futures_contract(symbol, contract_month=contract_month)
+
+            from ib_async import Future
+
+            kwargs: dict[str, Any] = {
+                "symbol": symbol,
+                "exchange": exchange,
+                "currency": currency,
+            }
+            if contract_month:
+                kwargs["lastTradeDateOrContractMonth"] = str(contract_month)
+            return Future(**kwargs)
+
+        if sec_type == "STK":
+            from ib_async import Stock
+
+            return Stock(symbol, exchange, currency)
+
+        raise IBKRContractError(f"Unsupported snapshot contract spec secType '{sec_type or 'unknown'}'")
+
+    def _resolve_spec(self, contract: IBKRContractSpec):
+        sec_type = str(contract.sec_type or "").strip().upper()
+        symbol = str(contract.symbol or "").strip().upper()
+        exchange = str(contract.exchange or "SMART").strip().upper()
+        currency = str(contract.currency or "USD").strip().upper()
+
+        if sec_type == "OPT":
+            contract_identity = {
+                "symbol": symbol,
+                "expiry": contract.expiry,
+                "strike": contract.strike,
+                "right": contract.right,
+                "exchange": exchange,
+                "currency": currency,
+                "multiplier": contract.multiplier,
+                "con_id": contract.con_id,
+            }
+            return resolve_option_contract(symbol, contract_identity=contract_identity)
+
+        if sec_type == "FUT":
+            contract_month = contract.contract_month
+            if exchange == "SMART":
+                return resolve_futures_contract(symbol, contract_month=contract_month)
+
+            from ib_async import Future
+
+            kwargs: dict[str, Any] = {
+                "symbol": symbol,
+                "exchange": exchange,
+                "currency": currency,
+            }
+            if contract_month:
+                kwargs["lastTradeDateOrContractMonth"] = str(contract_month)
+            return Future(**kwargs)
+
+        if sec_type == "STK":
+            from ib_async import Stock
+
+            return Stock(symbol, exchange, currency)
+
+        raise IBKRContractError(f"Unsupported snapshot contract spec secType '{sec_type or 'unknown'}'")
+
+    def _qualify_contract(self, ib, contract, *, budget_user_id: int | None = None):
         """Qualify a contract, with CUSIP fallback for bonds.
 
         IBKR's qualifyContracts() does not support secIdType=CUSIP for bonds.
@@ -147,13 +253,20 @@ class IBKRMarketDataClient:
         """
         # First attempt - may return None or raise for CUSIP bonds
         try:
-            qualified = ib.qualifyContracts(contract)
+            qualified = guard_ib_call(
+                operation="qualifyContracts",
+                fn=ib.qualifyContracts,
+                args=(contract,),
+                budget_user_id=budget_user_id,
+            )
             qualified_contract = next(
                 (row for row in (qualified or []) if row is not None and getattr(row, "conId", None)),
                 None,
             )
             if qualified_contract is not None:
                 return qualified_contract
+        except BudgetExceededError:
+            raise
         except Exception:
             # qualifyContracts raised (e.g. "no security definition")
             qualified_contract = None
@@ -162,16 +275,29 @@ class IBKRMarketDataClient:
         if getattr(contract, "secIdType", "") == "CUSIP":
             from .metadata import resolve_bond_by_cusip
 
-            resolved_con_id = resolve_bond_by_cusip(
-                ib,
-                getattr(contract, "secId", ""),
-                getattr(contract, "currency", "USD"),
-            )
+            if budget_user_id is None:
+                resolved_con_id = resolve_bond_by_cusip(
+                    ib,
+                    getattr(contract, "secId", ""),
+                    getattr(contract, "currency", "USD"),
+                )
+            else:
+                resolved_con_id = resolve_bond_by_cusip(
+                    ib,
+                    getattr(contract, "secId", ""),
+                    getattr(contract, "currency", "USD"),
+                    budget_user_id=budget_user_id,
+                )
             if resolved_con_id:
                 from ib_async import Bond
 
                 retry_contract = Bond(conId=resolved_con_id)
-                qualified = ib.qualifyContracts(retry_contract)
+                qualified = guard_ib_call(
+                    operation="qualifyContracts",
+                    fn=ib.qualifyContracts,
+                    args=(retry_contract,),
+                    budget_user_id=budget_user_id,
+                )
                 qualified_contract = next(
                     (row for row in (qualified or []) if row is not None and getattr(row, "conId", None)),
                     None,
@@ -185,6 +311,7 @@ class IBKRMarketDataClient:
         self,
         contract: Any,
         *,
+        budget_user_id: int | None = None,
         profile: InstrumentProfile,
         what_to_show: str,
         start_ts: pd.Timestamp,
@@ -200,7 +327,10 @@ class IBKRMarketDataClient:
                         attempt=attempt, max=IBKR_CONNECT_MAX_ATTEMPTS,
                     )
                 try:
-                    ib = self._connect_ib()
+                    if budget_user_id is None:
+                        ib = self._connect_ib()
+                    else:
+                        ib = self._connect_ib(budget_user_id=budget_user_id)
                     last_connect_exc = None
                     break
                 except IBKRConnectionError as exc:
@@ -208,24 +338,38 @@ class IBKRMarketDataClient:
                     if attempt == IBKR_CONNECT_MAX_ATTEMPTS:
                         raise
             try:
-                qualified_contract = self._qualify_contract(ib, contract)
+                if budget_user_id is None:
+                    qualified_contract = self._qualify_contract(ib, contract)
+                else:
+                    qualified_contract = self._qualify_contract(
+                        ib,
+                        contract,
+                        budget_user_id=budget_user_id,
+                    )
                 if qualified_contract is None:
                     raise IBKRContractError("Unable to qualify IBKR contract")
 
                 duration_str = self._duration_for_request(profile, start_ts, end_ts)
-                bars = ib.reqHistoricalData(
-                    qualified_contract,
-                    endDateTime="",
-                    durationStr=duration_str,
-                    barSizeSetting=profile.bar_size,
-                    whatToShow=what_to_show,
-                    useRTH=profile.use_rth,
-                    formatDate=1,
+                bars = guard_ib_call(
+                    operation="reqHistoricalData",
+                    fn=ib.reqHistoricalData,
+                    args=(qualified_contract,),
+                    kwargs={
+                        "endDateTime": "",
+                        "durationStr": duration_str,
+                        "barSizeSetting": profile.bar_size,
+                        "whatToShow": what_to_show,
+                        "useRTH": profile.use_rth,
+                        "formatDate": 1,
+                    },
+                    budget_user_id=budget_user_id,
                 )
                 if not bars:
                     raise IBKRNoDataError("No historical bars returned")
                 return list(bars)
             except IBKRDataError:
+                raise
+            except BudgetExceededError:
                 raise
             except Exception as exc:
                 text = str(exc).lower()
@@ -291,6 +435,9 @@ class IBKRMarketDataClient:
         profile: InstrumentProfile | None = None,
         what_to_show: str | None = None,
         contract_identity: dict[str, Any] | None = None,
+        raise_on_transient: bool = False,
+        *,
+        budget_user_id: int | None = None,
     ) -> pd.Series:
         """Fetch historical IBKR series with profile-based fallback chain.
 
@@ -348,20 +495,24 @@ class IBKRMarketDataClient:
                 use_rth=resolved_profile.use_rth,
                 start_date=start_ts,
                 end_date=end_ts,
+                contract_identity=contract_identity,
             )
             if cached is not None and not cached.empty:
                 cached.name = sym
                 return cached
 
+        _last_transient: Exception | None = None
         for candidate in chain:
             try:
-                bars = self._request_bars(
-                    contract,
-                    profile=resolved_profile,
-                    what_to_show=candidate,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                )
+                request_kwargs = {
+                    "profile": resolved_profile,
+                    "what_to_show": candidate,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                }
+                if budget_user_id is not None:
+                    request_kwargs["budget_user_id"] = budget_user_id
+                bars = self._request_bars(contract, **request_kwargs)
                 series = self._normalize_bars(
                     sym,
                     bars,
@@ -380,23 +531,34 @@ class IBKRMarketDataClient:
                     use_rth=resolved_profile.use_rth,
                     start_date=start_ts,
                     end_date=end_ts,
+                    contract_identity=contract_identity,
                 )
                 return series
             except IBKRNoDataError:
                 continue
             except IBKREntitlementError as exc:
                 logger.warning("IBKR entitlement issue for %s (%s): %s", sym, candidate, exc)
+                _last_transient = exc
                 continue
             except IBKRContractError as exc:
                 logger.warning("IBKR contract invalid for %s (%s): %s", sym, candidate, exc)
                 return pd.Series(dtype=float)
-            except IBKRConnectionError:
+            except IBKRConnectionError as exc:
                 logger.info("IB Gateway not running; IBKR fallback unavailable for %s", sym)
-                return pd.Series(dtype=float)
+                _last_transient = exc
+                if not raise_on_transient:
+                    return pd.Series(dtype=float)
+                continue
+            except IBKRDataError as exc:
+                logger.warning("IBKR data error for %s (%s): %s", sym, candidate, exc)
+                _last_transient = exc
+                continue
             except Exception as exc:
                 logger.warning("IBKR historical data failed for %s (%s): %s", sym, candidate, exc)
                 continue
 
+        if raise_on_transient and _last_transient is not None:
+            raise _last_transient
         return pd.Series(dtype=float)
 
     def fetch_monthly_close_futures(
@@ -404,6 +566,8 @@ class IBKRMarketDataClient:
         symbol: str,
         start_date: Any,
         end_date: Any,
+        *,
+        budget_user_id: int | None = None,
     ) -> pd.Series:
         """Convenience wrapper for futures month-end close series."""
         profile = get_profile("futures")
@@ -413,6 +577,7 @@ class IBKRMarketDataClient:
             start_date=start_date,
             end_date=end_date,
             profile=profile,
+            budget_user_id=budget_user_id,
         )
         if series.empty:
             return series
@@ -428,6 +593,9 @@ class IBKRMarketDataClient:
         symbol: str,
         start_date: Any,
         end_date: Any,
+        raise_on_transient: bool = False,
+        *,
+        budget_user_id: int | None = None,
     ) -> pd.Series:
         """Convenience wrapper for futures daily close series."""
         profile = get_profile("futures_daily")
@@ -437,6 +605,52 @@ class IBKRMarketDataClient:
             start_date=start_date,
             end_date=end_date,
             profile=profile,
+            raise_on_transient=raise_on_transient,
+            budget_user_id=budget_user_id,
+        )
+
+    def fetch_daily_close_fx(
+        self,
+        symbol: str,
+        start_date: Any,
+        end_date: Any,
+        raise_on_transient: bool = False,
+        *,
+        budget_user_id: int | None = None,
+    ) -> pd.Series:
+        """Daily FX close series (no month-end resample)."""
+        profile = get_profile("fx")
+        return self.fetch_series(
+            symbol=symbol,
+            instrument_type="fx",
+            start_date=start_date,
+            end_date=end_date,
+            profile=profile,
+            raise_on_transient=raise_on_transient,
+            budget_user_id=budget_user_id,
+        )
+
+    def fetch_daily_close_bond(
+        self,
+        symbol: str,
+        start_date: Any,
+        end_date: Any,
+        contract_identity: dict[str, Any] | None = None,
+        raise_on_transient: bool = False,
+        *,
+        budget_user_id: int | None = None,
+    ) -> pd.Series:
+        """Daily bond close series (no month-end resample)."""
+        profile = get_profile("bond")
+        return self.fetch_series(
+            symbol=symbol,
+            instrument_type="bond",
+            start_date=start_date,
+            end_date=end_date,
+            profile=profile,
+            contract_identity=contract_identity,
+            raise_on_transient=raise_on_transient,
+            budget_user_id=budget_user_id,
         )
 
     def fetch_monthly_close_fx(
@@ -444,6 +658,8 @@ class IBKRMarketDataClient:
         symbol: str,
         start_date: Any,
         end_date: Any,
+        *,
+        budget_user_id: int | None = None,
     ) -> pd.Series:
         """Convenience wrapper for FX month-end close series from daily bars."""
         profile = get_profile("fx")
@@ -453,6 +669,7 @@ class IBKRMarketDataClient:
             start_date=start_date,
             end_date=end_date,
             profile=profile,
+            budget_user_id=budget_user_id,
         )
         if series.empty:
             return series
@@ -469,6 +686,8 @@ class IBKRMarketDataClient:
         start_date: Any,
         end_date: Any,
         contract_identity: dict[str, Any] | None = None,
+        *,
+        budget_user_id: int | None = None,
     ) -> pd.Series:
         """Convenience wrapper for bond month-end close series from daily bars."""
         profile = get_profile("bond")
@@ -479,6 +698,7 @@ class IBKRMarketDataClient:
             end_date=end_date,
             profile=profile,
             contract_identity=contract_identity,
+            budget_user_id=budget_user_id,
         )
         if series.empty:
             return series
@@ -495,6 +715,8 @@ class IBKRMarketDataClient:
         start_date: Any,
         end_date: Any,
         contract_identity: dict[str, Any] | None = None,
+        *,
+        budget_user_id: int | None = None,
     ) -> pd.Series:
         """Stub option month-end mark series from daily bars."""
         profile = get_profile("option")
@@ -505,6 +727,7 @@ class IBKRMarketDataClient:
             end_date=end_date,
             profile=profile,
             contract_identity=contract_identity,
+            budget_user_id=budget_user_id,
         )
         if series.empty:
             return series
@@ -568,9 +791,11 @@ class IBKRMarketDataClient:
 
     def fetch_snapshot(
         self,
-        contracts: list["Contract"],
+        contracts: list[IBKRContractSpec | Any],
         timeout: float = IBKR_SNAPSHOT_TIMEOUT,
         option_timeout: float = IBKR_OPTION_SNAPSHOT_TIMEOUT,
+        *,
+        budget_user_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Snapshot current bid/ask/last/volume/greeks for one or more contracts.
 
@@ -610,11 +835,19 @@ class IBKRMarketDataClient:
         with ibkr_shared_lock:
             ib = None
             try:
-                ib = self._connect_ib()
+                if budget_user_id is None:
+                    ib = self._connect_ib()
+                else:
+                    ib = self._connect_ib(budget_user_id=budget_user_id)
 
                 for idx, contract in enumerate(contracts):
                     try:
-                        qualified = ib.qualifyContracts(contract)
+                        qualified = guard_ib_call(
+                            operation="qualifyContracts",
+                            fn=ib.qualifyContracts,
+                            args=(self._coerce_snapshot_contract(contract),),
+                            budget_user_id=budget_user_id,
+                        )
                         if not qualified:
                             pre_errors[idx] = "unable to qualify contract"
                             continue
@@ -623,13 +856,15 @@ class IBKRMarketDataClient:
                             pre_errors[idx] = "unable to qualify contract"
                             continue
                         qualified_by_index[idx] = qualified_contract
+                    except BudgetExceededError:
+                        raise
                     except Exception as exc:
                         pre_errors[idx] = str(exc) or "qualification failed"
 
                 # Detect if any qualified contract is an option — use longer
                 # timeout so IBKR has time to compute model Greeks.
                 has_options = any(
-                    str(getattr(c, "secType", "") or "").upper() in ("OPT", "FOP")
+                    str(getattr(c, "secType", "") or "").upper() == "OPT"
                     for c in qualified_by_index.values()
                 )
                 effective_timeout = option_timeout_seconds if has_options else timeout_seconds
@@ -643,15 +878,22 @@ class IBKRMarketDataClient:
 
                 for idx, qualified_contract in qualified_by_index.items():
                     sec_type = str(getattr(qualified_contract, "secType", "") or "").upper()
-                    generic_ticks = "100,101,106" if sec_type in ("OPT", "FOP") else ""
+                    generic_ticks = "100,101,106" if sec_type == "OPT" else ""
                     try:
-                        tickers_by_index[idx] = ib.reqMktData(
-                            qualified_contract,
-                            genericTickList=generic_ticks,
-                            snapshot=not use_streaming,
-                            regulatorySnapshot=False,
-                            mktDataOptions=[],
+                        tickers_by_index[idx] = guard_ib_call(
+                            operation="reqMktData",
+                            fn=ib.reqMktData,
+                            args=(qualified_contract,),
+                            kwargs={
+                                "genericTickList": generic_ticks,
+                                "snapshot": not use_streaming,
+                                "regulatorySnapshot": False,
+                                "mktDataOptions": [],
+                            },
+                            budget_user_id=budget_user_id,
                         )
+                    except BudgetExceededError:
+                        raise
                     except Exception as exc:
                         pre_errors[idx] = str(exc) or "snapshot request failed"
 
@@ -718,7 +960,14 @@ class IBKRMarketDataClient:
                     # Cancel streaming subscriptions.
                     for ticker in tickers_by_index.values():
                         try:
-                            ib.cancelMktData(getattr(ticker, "contract", None) or ticker)
+                            guard_ib_call(
+                                operation="cancelMktData",
+                                fn=ib.cancelMktData,
+                                args=((getattr(ticker, "contract", None) or ticker),),
+                                budget_user_id=budget_user_id,
+                            )
+                        except BudgetExceededError:
+                            raise
                         except Exception:
                             pass
                 elif effective_timeout > 0:
@@ -731,6 +980,8 @@ class IBKRMarketDataClient:
                             pre_errors[cidx] = f"not_subscribed: {msg}"
             except IBKRConnectionError as exc:
                 return [{"error": str(exc)} for _ in contracts]
+            except BudgetExceededError:
+                raise
             except Exception as exc:
                 return [{"error": str(exc) or "snapshot request failed"} for _ in contracts]
             finally:
@@ -764,7 +1015,7 @@ class IBKRMarketDataClient:
             sec_type = str(getattr(contract_for_fields, "secType", "") or "").upper()
             right = str(getattr(contract_for_fields, "right", "") or "").upper()
 
-            if sec_type in ("OPT", "FOP"):
+            if sec_type == "OPT":
                 volume = self._value_for_option_side(
                     ticker,
                     right=right,
@@ -824,6 +1075,8 @@ class IBKRMarketDataClient:
         self,
         symbol: str,
         timeout: float = IBKR_FUTURES_CURVE_TIMEOUT,
+        *,
+        budget_user_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Snapshot last/bid/ask/volume for all active monthly contracts.
 
@@ -840,12 +1093,18 @@ class IBKRMarketDataClient:
         with ibkr_shared_lock:
             ib = None
             try:
-                ib = self._connect_ib()
+                if budget_user_id is None:
+                    ib = self._connect_ib()
+                else:
+                    ib = self._connect_ib(budget_user_id=budget_user_id)
                 logger.info(
                     "futures_curve: connected to IBKR (host=%s port=%s client_id=%s)",
                     self.host, self.port, self.client_id,
                 )
-                months = fetch_futures_months(ib, sym)
+                if budget_user_id is None:
+                    months = fetch_futures_months(ib, sym)
+                else:
+                    months = fetch_futures_months(ib, sym, budget_user_id=budget_user_id)
                 logger.info(
                     "futures_curve: fetch_futures_months returned %d months for %s",
                     len(months), sym,
@@ -894,7 +1153,14 @@ class IBKRMarketDataClient:
             "futures_curve: fetching snapshots for %d contracts (%s)",
             len(contracts), sym,
         )
-        snapshots = self.fetch_snapshot(contracts, timeout=timeout)
+        if budget_user_id is None:
+            snapshots = self.fetch_snapshot(contracts, timeout=timeout)
+        else:
+            snapshots = self.fetch_snapshot(
+                contracts,
+                timeout=timeout,
+                budget_user_id=budget_user_id,
+            )
         logger.info(
             "futures_curve: fetch_snapshot returned %d results for %s",
             len(snapshots), sym,

@@ -154,8 +154,18 @@ def resolve_bond_contract(
         bond.currency = str(identity.get("currency") or "USD").upper()
         return bond
 
+    isin = identity.get("isin")
+    if isinstance(isin, str) and isin.strip():
+        from ib_async import Bond
+
+        bond = Bond()
+        bond.secIdType = "ISIN"
+        bond.secId = isin.strip()
+        bond.currency = str(identity.get("currency") or "USD").upper()
+        return bond
+
     raise IBKRContractError(
-        "Bond pricing requires contract_identity with con_id or cusip"
+        "Bond pricing requires contract_identity with con_id, cusip, or isin"
     )
 
 

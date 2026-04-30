@@ -45,6 +45,9 @@ IBKR_CLIENT_ID: int = _int_env("IBKR_CLIENT_ID", 1)
 # with ibkr-mcp (IBKR_CLIENT_ID) or market data (IBKR_CLIENT_ID + 1).
 IBKR_TRADE_CLIENT_ID: int = _int_env("IBKR_TRADE_CLIENT_ID", IBKR_CLIENT_ID + 2)
 IBKR_TIMEOUT: int = _int_env("IBKR_TIMEOUT", 10)
+# Timeout for individual IB API requests (e.g. reqCompletedOrders).
+# ib_async defaults to 0 (infinite) — this prevents indefinite hangs.
+IBKR_REQUEST_TIMEOUT: int = _int_env("IBKR_REQUEST_TIMEOUT", 30)
 IBKR_READONLY: bool = os.getenv("IBKR_READONLY", "false").lower() == "true"
 IBKR_AUTHORIZED_ACCOUNTS: list[str] = [
     account.strip()

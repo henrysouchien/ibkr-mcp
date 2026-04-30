@@ -22,6 +22,12 @@ _pkg_dir = Path(__file__).resolve().parent
 load_dotenv(_pkg_dir / ".env", override=False)
 load_dotenv(_pkg_dir.parent / ".env", override=False)
 
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except Exception:
+    pass
+
 # Restore stdout for MCP transport.
 sys.stdout = _real_stdout
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -33,6 +34,18 @@ from .config import IBKR_FUTURES_CURVE_TIMEOUT
 IBKRMarketDataClient = None
 
 
+def _ibkr_fx_daily_enabled():
+    return os.getenv("IBKR_FX_DAILY_ENABLED", "0").strip() == "1"
+
+
+def _ibkr_bond_daily_enabled():
+    return os.getenv("IBKR_BOND_DAILY_ENABLED", "0").strip() == "1"
+
+
+def _ibkr_ts_cache_enabled():
+    return os.getenv("IBKR_TIMESERIES_CACHE_ENABLED", "1").strip() == "1"
+
+
 @lru_cache(maxsize=1)
 def _load_ibkr_exchange_mappings() -> dict[str, Any]:
     path = Path(__file__).resolve().with_name("exchange_mappings.yaml")
@@ -51,7 +64,7 @@ def get_ibkr_futures_fmp_map() -> dict[str, str]:
     for symbol, spec in all_specs.items():
         if symbol not in ibkr_routing:
             continue
-        mapped = str(spec.fmp_symbol or "").strip().upper()
+        mapped = str(spec.data_symbol or "").strip().upper()
         if mapped:
             out[symbol] = mapped
     return out
@@ -153,12 +166,12 @@ def fetch_ibkr_monthly_close(
         return pd.Series(dtype=float)
 
 
-def fetch_ibkr_daily_close_futures(
+def _raw_daily_futures(
     symbol: str,
     start_date: Union[str, datetime],
     end_date: Union[str, datetime],
 ) -> pd.Series:
-    """Fetch daily futures close series through the IBKR market data client."""
+    """Raw IBKR daily futures fetch (fail-open, existing contract)."""
     try:
         client_cls = IBKRMarketDataClient
         if client_cls is None:
@@ -170,6 +183,49 @@ def fetch_ibkr_daily_close_futures(
     except Exception as exc:
         logger.warning("IBKR daily futures fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
+
+
+def _raw_daily_futures_for_cache(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+) -> pd.Series:
+    """Raw fetch for cache loader with transient failures propagated."""
+    client_cls = IBKRMarketDataClient
+    if client_cls is None:
+        from .market_data import IBKRMarketDataClient as _IBKRMarketDataClient
+
+        client_cls = _IBKRMarketDataClient
+    client = client_cls()
+    return client.fetch_daily_close_futures(
+        symbol,
+        start_date,
+        end_date,
+        raise_on_transient=True,
+    )
+
+
+def fetch_ibkr_daily_close_futures(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+) -> pd.Series:
+    """Public wrapper for daily futures close with optional cache."""
+    if _ibkr_ts_cache_enabled():
+        try:
+            from .timeseries_cache import cached_daily_fetch
+
+            return cached_daily_fetch(
+                symbol,
+                start_date,
+                end_date,
+                instrument_type="futures",
+                raw_fetcher=_raw_daily_futures_for_cache,
+            )
+        except Exception as exc:
+            logger.warning("IBKR cache-backed daily futures failed for %s, falling back: %s", symbol, exc)
+            return _raw_daily_futures(symbol, start_date, end_date)
+    return _raw_daily_futures(symbol, start_date, end_date)
 
 
 def fetch_ibkr_fx_monthly_close(
@@ -189,6 +245,70 @@ def fetch_ibkr_fx_monthly_close(
     except Exception as exc:
         logger.warning("IBKR FX fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
+
+
+def _raw_daily_fx(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+) -> pd.Series:
+    """Raw IBKR daily FX fetch (fail-open, existing contract)."""
+    try:
+        client_cls = IBKRMarketDataClient
+        if client_cls is None:
+            from .market_data import IBKRMarketDataClient as _IBKRMarketDataClient
+
+            client_cls = _IBKRMarketDataClient
+        client = client_cls()
+        return client.fetch_daily_close_fx(symbol, start_date, end_date)
+    except Exception as exc:
+        logger.warning("IBKR daily FX fetch failed for %s: %s", symbol, exc)
+        return pd.Series(dtype=float)
+
+
+def _raw_daily_fx_for_cache(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+) -> pd.Series:
+    """Raw IBKR daily FX fetch with transient failures propagated."""
+    client_cls = IBKRMarketDataClient
+    if client_cls is None:
+        from .market_data import IBKRMarketDataClient as _IBKRMarketDataClient
+
+        client_cls = _IBKRMarketDataClient
+    client = client_cls()
+    return client.fetch_daily_close_fx(
+        symbol,
+        start_date,
+        end_date,
+        raise_on_transient=True,
+    )
+
+
+def fetch_ibkr_daily_close_fx(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+) -> pd.Series:
+    """Fetch daily FX close series through the IBKR market data client."""
+    if not _ibkr_fx_daily_enabled():
+        return pd.Series(dtype=float)
+    if _ibkr_ts_cache_enabled():
+        try:
+            from .timeseries_cache import cached_daily_fetch
+
+            return cached_daily_fetch(
+                symbol,
+                start_date,
+                end_date,
+                instrument_type="fx",
+                raw_fetcher=_raw_daily_fx_for_cache,
+            )
+        except Exception as exc:
+            logger.warning("IBKR cache-backed daily FX failed for %s, falling back: %s", symbol, exc)
+            return _raw_daily_fx(symbol, start_date, end_date)
+    return _raw_daily_fx(symbol, start_date, end_date)
 
 
 def fetch_ibkr_bond_monthly_close(
@@ -214,6 +334,80 @@ def fetch_ibkr_bond_monthly_close(
     except Exception as exc:
         logger.warning("IBKR bond fetch failed for %s: %s", symbol, exc)
         return pd.Series(dtype=float)
+
+
+def _raw_daily_bond(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+    contract_identity: dict | None = None,
+) -> pd.Series:
+    """Raw IBKR daily bond fetch (fail-open, existing contract)."""
+    try:
+        client_cls = IBKRMarketDataClient
+        if client_cls is None:
+            from .market_data import IBKRMarketDataClient as _IBKRMarketDataClient
+
+            client_cls = _IBKRMarketDataClient
+        client = client_cls()
+        return client.fetch_daily_close_bond(
+            symbol,
+            start_date,
+            end_date,
+            contract_identity=contract_identity,
+        )
+    except Exception as exc:
+        logger.warning("IBKR daily bond fetch failed for %s: %s", symbol, exc)
+        return pd.Series(dtype=float)
+
+
+def _raw_daily_bond_for_cache(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+    contract_identity: dict | None = None,
+) -> pd.Series:
+    """Raw IBKR daily bond fetch with transient failures propagated."""
+    client_cls = IBKRMarketDataClient
+    if client_cls is None:
+        from .market_data import IBKRMarketDataClient as _IBKRMarketDataClient
+
+        client_cls = _IBKRMarketDataClient
+    client = client_cls()
+    return client.fetch_daily_close_bond(
+        symbol,
+        start_date,
+        end_date,
+        contract_identity=contract_identity,
+        raise_on_transient=True,
+    )
+
+
+def fetch_ibkr_daily_close_bond(
+    symbol: str,
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+    contract_identity: dict | None = None,
+) -> pd.Series:
+    """Fetch daily bond close series through the IBKR market data client."""
+    if not _ibkr_bond_daily_enabled():
+        return pd.Series(dtype=float)
+    if _ibkr_ts_cache_enabled():
+        try:
+            from .timeseries_cache import cached_daily_fetch
+
+            return cached_daily_fetch(
+                symbol,
+                start_date,
+                end_date,
+                instrument_type="bond",
+                raw_fetcher=_raw_daily_bond_for_cache,
+                contract_identity=contract_identity,
+            )
+        except Exception as exc:
+            logger.warning("IBKR cache-backed daily bond failed for %s, falling back: %s", symbol, exc)
+            return _raw_daily_bond(symbol, start_date, end_date, contract_identity=contract_identity)
+    return _raw_daily_bond(symbol, start_date, end_date, contract_identity=contract_identity)
 
 
 def fetch_ibkr_option_monthly_mark(
@@ -279,6 +473,8 @@ __all__ = [
     "IBKRClient",
     "fetch_ibkr_monthly_close",
     "fetch_ibkr_daily_close_futures",
+    "fetch_ibkr_daily_close_fx",
+    "fetch_ibkr_daily_close_bond",
     "fetch_ibkr_fx_monthly_close",
     "fetch_ibkr_bond_monthly_close",
     "fetch_ibkr_option_monthly_mark",

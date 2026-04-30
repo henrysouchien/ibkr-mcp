@@ -27,6 +27,7 @@ ibkr_futures_exchanges:
   DAX: { exchange: EUREX, currency: EUR }
   Z: { exchange: ICEEU, currency: GBP }
   HSI: { exchange: HKFE, currency: HKD }
+  MHI: { exchange: HKFE, currency: HKD }
   GC: { exchange: COMEX, currency: USD }
   MGC: { exchange: COMEX, currency: USD }
   SI: { exchange: COMEX, currency: USD }

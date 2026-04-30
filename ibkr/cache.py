@@ -27,6 +27,25 @@ from pandas.errors import EmptyDataError, ParserError
 CURRENT_MONTH_TTL_HOURS = 4
 
 
+def _contract_identity_fingerprint(contract_identity: dict[str, Any] | None) -> str:
+    """Return a stable fingerprint for bond identifiers used in cache keys."""
+
+    if not isinstance(contract_identity, dict):
+        return ""
+
+    id_parts: list[str] = []
+    for key in ("con_id", "cusip", "isin"):
+        value = contract_identity.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            id_parts.append(f"{key}={text}")
+    if not id_parts:
+        return ""
+    return hashlib.md5("|".join(sorted(id_parts)).encode()).hexdigest()[:8]
+
+
 def _project_root() -> Path:
     """Return default cache directory with portable fallback behavior."""
     configured = os.getenv("IBKR_CACHE_DIR")
@@ -119,10 +138,12 @@ def cache_key(
     use_rth: bool,
     start_date: Any,
     end_date: Any,
+    contract_identity: dict[str, Any] | None = None,
 ) -> str:
     """Build deterministic cache key fingerprint for an IBKR request."""
     start_iso = _to_timestamp(start_date).date().isoformat()
     end_iso = _to_timestamp(end_date).date().isoformat()
+    identity_fingerprint = _contract_identity_fingerprint(contract_identity)
     key = "|".join(
         [
             str(symbol or "").strip().upper(),
@@ -132,6 +153,7 @@ def cache_key(
             "rth" if bool(use_rth) else "all",
             start_iso,
             end_iso,
+            identity_fingerprint,
         ]
     )
     return hashlib.md5(key.encode()).hexdigest()
@@ -146,6 +168,7 @@ def _cache_path(
     use_rth: bool,
     start_date: Any,
     end_date: Any,
+    contract_identity: dict[str, Any] | None = None,
     base_dir: str | Path | None = None,
 ) -> Path:
     """Build on-disk cache path for the deterministic request key."""
@@ -158,6 +181,7 @@ def _cache_path(
         use_rth=use_rth,
         start_date=start_date,
         end_date=end_date,
+        contract_identity=contract_identity,
     )
     return _cache_dir(base_dir) / f"ibkr_{key}.parquet"
 
@@ -171,6 +195,7 @@ def get_cached(
     use_rth: bool,
     start_date: Any,
     end_date: Any,
+    contract_identity: dict[str, Any] | None = None,
     base_dir: str | Path | None = None,
     now: datetime | None = None,
 ) -> pd.Series | None:
@@ -188,6 +213,7 @@ def get_cached(
         use_rth=use_rth,
         start_date=start_date,
         end_date=end_date,
+        contract_identity=contract_identity,
         base_dir=base_dir,
     )
     if not path.is_file():
@@ -215,6 +241,7 @@ def put_cache(
     use_rth: bool,
     start_date: Any,
     end_date: Any,
+    contract_identity: dict[str, Any] | None = None,
     base_dir: str | Path | None = None,
 ) -> Path | None:
     """Persist non-empty series in parquet format and return cache file path."""
@@ -236,6 +263,7 @@ def put_cache(
         use_rth=use_rth,
         start_date=start_date,
         end_date=end_date,
+        contract_identity=contract_identity,
         base_dir=base_dir,
     )
     frame = cleaned.to_frame(name="value")

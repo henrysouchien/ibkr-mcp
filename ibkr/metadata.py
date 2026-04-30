@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
+from ._budget import guard_ib_call
 from .contracts import _futures_exchange_meta, resolve_futures_contract
 from .exceptions import IBKRContractError
 
@@ -59,8 +60,6 @@ def _normalize_contract_detail(contract_detail) -> dict[str, Any]:
         "primary_exchange": getattr(contract, "primaryExchange", None) if contract else None,
         "currency": getattr(contract, "currency", None) if contract else None,
         "multiplier": getattr(contract, "multiplier", None) if contract else None,
-        "strike": float(getattr(contract, "strike", 0)) if contract else None,
-        "right": str(getattr(contract, "right", "")) if contract else None,
         "min_tick": _safe_float(getattr(contract_detail, "minTick", None)),
         "trading_class": getattr(contract, "tradingClass", None) if contract else None,
         "valid_exchanges": valid_exchanges,
@@ -82,10 +81,20 @@ def fetch_contract_details(
     sec_type: str = "STK",
     exchange: str = "SMART",
     currency: str = "USD",
+    *,
+    budget_user_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch normalized contract details."""
     contract = _build_contract(symbol, sec_type, exchange, currency)
-    details = list(ib.reqContractDetails(contract) or [])
+    details = list(
+        guard_ib_call(
+            operation="reqContractDetails",
+            fn=ib.reqContractDetails,
+            args=(contract,),
+            budget_user_id=budget_user_id,
+        )
+        or []
+    )
     if not details:
         raise IBKRContractError(
             f"No contract details found for symbol={symbol} sec_type={sec_type}"
@@ -93,7 +102,12 @@ def fetch_contract_details(
     return [_normalize_contract_detail(detail) for detail in details]
 
 
-def fetch_futures_months(ib, symbol: str) -> list[dict[str, Any]]:
+def fetch_futures_months(
+    ib,
+    symbol: str,
+    *,
+    budget_user_id: int | None = None,
+) -> list[dict[str, Any]]:
     """Discover available contract months for a futures root symbol.
 
     Returns list of dicts sorted by last_trade_date ascending, with keys:
@@ -108,7 +122,15 @@ def fetch_futures_months(ib, symbol: str) -> list[dict[str, Any]]:
 
     exchange, currency = _futures_exchange_meta(sym)
     contract = Future(symbol=sym, exchange=exchange, currency=currency)
-    details = list(ib.reqContractDetails(contract) or [])
+    details = list(
+        guard_ib_call(
+            operation="reqContractDetails",
+            fn=ib.reqContractDetails,
+            args=(contract,),
+            budget_user_id=budget_user_id,
+        )
+        or []
+    )
     if not details:
         raise IBKRContractError(f"No futures contract months found for symbol={sym}")
 
@@ -157,6 +179,8 @@ def fetch_option_chain(
     symbol: str,
     sec_type: str = "STK",
     exchange: str = "SMART",
+    *,
+    budget_user_id: int | None = None,
 ) -> dict[str, Any]:
     """Fetch option chain metadata for STK/FUT underlyings."""
     from ib_async import Stock
@@ -175,7 +199,15 @@ def fetch_option_chain(
     else:
         raise IBKRContractError(f"Option chain supports STK or FUT underlyings, got {sec}")
 
-    qualified = list(ib.qualifyContracts(underlying) or [])
+    qualified = list(
+        guard_ib_call(
+            operation="qualifyContracts",
+            fn=ib.qualifyContracts,
+            args=(underlying,),
+            budget_user_id=budget_user_id,
+        )
+        or []
+    )
     if not qualified:
         raise IBKRContractError(f"Unable to qualify underlying for option chain: {sym}")
 
@@ -189,11 +221,16 @@ def fetch_option_chain(
         fut_fop_exchange = str(getattr(resolved, "exchange", "") or fut_fop_exchange or exchange)
 
     chains = list(
-        ib.reqSecDefOptParams(
-            underlyingSymbol=underlying_symbol,
-            futFopExchange=fut_fop_exchange,
-            underlyingSecType=sec,
-            underlyingConId=int(con_id),
+        guard_ib_call(
+            operation="reqSecDefOptParams",
+            fn=ib.reqSecDefOptParams,
+            kwargs={
+                "underlyingSymbol": underlying_symbol,
+                "futFopExchange": fut_fop_exchange,
+                "underlyingSecType": sec,
+                "underlyingConId": int(con_id),
+            },
+            budget_user_id=budget_user_id,
         )
         or []
     )
@@ -209,6 +246,8 @@ def resolve_bond_by_cusip(
     ib,
     cusip: str,
     currency: str = "USD",
+    *,
+    budget_user_id: int | None = None,
 ) -> int | None:
     """Search IBKR bond contracts and match CUSIP from secIdList.
 
@@ -231,7 +270,15 @@ def resolve_bond_by_cusip(
         return None  # Non-Treasury bonds not yet supported
 
     contract = Contract(secType="BOND", symbol="US-T", currency=currency)
-    details = list(ib.reqContractDetails(contract) or [])
+    details = list(
+        guard_ib_call(
+            operation="reqContractDetails",
+            fn=ib.reqContractDetails,
+            args=(contract,),
+            budget_user_id=budget_user_id,
+        )
+        or []
+    )
 
     for detail in details:
         sec_id_list = getattr(detail, "secIdList", None) or []

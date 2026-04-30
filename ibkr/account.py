@@ -8,6 +8,9 @@ from typing import Any
 
 import pandas as pd
 
+from app_platform.api_budget import BudgetExceededError
+
+from ._budget import guard_ib_call
 from .config import IBKR_PNL_POLL_INTERVAL, IBKR_PNL_TIMEOUT
 from .exceptions import IBKRTimeoutError
 
@@ -55,79 +58,12 @@ _SUMMARY_TAGS = {
 }
 
 
-def _safe_float(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_not_nan(value: Any) -> bool:
-    as_float = _safe_float(value)
-    if as_float is None:
-        return False
-    return not math.isnan(as_float)
-
-
-def _ib_sleep(ib, seconds: float) -> None:
-    try:
-        sleep_fn = getattr(ib, "sleep", None)
-        if callable(sleep_fn):
-            sleep_fn(seconds)
-        else:
-            time.sleep(seconds)
-    except Exception:
-        time.sleep(seconds)
-
-
-def _wait_for_pnl_ready(ib, pnl_obj, *, timeout_seconds: float, poll_interval: float) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if _is_not_nan(getattr(pnl_obj, "dailyPnL", None)):
-            return
-        _ib_sleep(ib, poll_interval)
-    raise IBKRTimeoutError("Timed out waiting for IBKR PnL update")
-
-
-def fetch_positions(ib, account_id: str | None = None) -> pd.DataFrame:
-    """Fetch IBKR positions and normalize to DataFrame."""
-    ib.reqPositions()
-    positions = list(ib.positions() or [])
-
-    rows: list[dict[str, Any]] = []
-    for pos in positions:
-        acct = getattr(pos, "account", None)
-        if account_id and acct != account_id:
-            continue
-        contract = getattr(pos, "contract", None)
-        rows.append(
-            {
-                "account": acct,
-                "symbol": getattr(contract, "symbol", None) if contract else None,
-                "sec_type": getattr(contract, "secType", None) if contract else None,
-                "currency": getattr(contract, "currency", None) if contract else None,
-                "exchange": getattr(contract, "exchange", None) if contract else None,
-                "con_id": getattr(contract, "conId", None) if contract else None,
-                "position": _safe_float(getattr(pos, "position", None)),
-                "avg_cost": _safe_float(getattr(pos, "avgCost", None)),
-            }
-        )
-
-    if not rows:
-        return pd.DataFrame(columns=_POSITION_COLUMNS)
-    frame = pd.DataFrame(rows, columns=_POSITION_COLUMNS)
-    return frame.sort_values(["account", "symbol"], na_position="last").reset_index(drop=True)
-
-
-def fetch_portfolio_items(ib, account_id: str | None = None) -> pd.DataFrame:
-    """Fetch IBKR portfolio items with market values via reqAccountUpdates."""
-    items = list(ib.portfolio() or [])
-    if not items:
-        ib.reqAccountUpdates(account=account_id or "")
-        items = list(ib.portfolio() or [])
-
+def _portfolio_frame_from_items(
+    items: list[Any],
+    *,
+    account_id: str | None = None,
+) -> pd.DataFrame:
+    """Normalize IBKR portfolio items into the canonical DataFrame schema."""
     rows: list[dict[str, Any]] = []
     for item in items:
         acct = getattr(item, "account", None)
@@ -166,13 +102,12 @@ def fetch_portfolio_items(ib, account_id: str | None = None) -> pd.DataFrame:
     return frame.sort_values(["account", "symbol"], na_position="last").reset_index(drop=True)
 
 
-def fetch_cash_balances(ib, account_id: str | None = None) -> dict[str, float]:
-    """Fetch per-currency cash balances from accountValues (CashBalance tag)."""
-    account_values = list(ib.accountValues(account=account_id) or [])
-    if not account_values:
-        ib.reqAccountUpdates(account=account_id or "")
-        account_values = list(ib.accountValues(account=account_id) or [])
-
+def _cash_balances_from_account_values(
+    account_values: list[Any],
+    *,
+    account_id: str | None = None,
+) -> dict[str, float]:
+    """Extract per-currency cash balances from IBKR account values."""
     balances: dict[str, float] = {}
     for av in account_values:
         if account_id and getattr(av, "account", None) not in (None, "", account_id):
@@ -189,11 +124,162 @@ def fetch_cash_balances(ib, account_id: str | None = None) -> dict[str, float]:
     return balances
 
 
-def fetch_account_summary(ib, account_id: str | None = None) -> dict[str, float]:
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_not_nan(value: Any) -> bool:
+    as_float = _safe_float(value)
+    if as_float is None:
+        return False
+    return not math.isnan(as_float)
+
+
+def _ib_sleep(ib, seconds: float) -> None:
+    try:
+        sleep_fn = getattr(ib, "sleep", None)
+        if callable(sleep_fn):
+            sleep_fn(seconds)
+        else:
+            time.sleep(seconds)
+    except Exception:
+        time.sleep(seconds)
+
+
+def _wait_for_pnl_ready(ib, pnl_obj, *, timeout_seconds: float, poll_interval: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _is_not_nan(getattr(pnl_obj, "dailyPnL", None)):
+            return
+        _ib_sleep(ib, poll_interval)
+    raise IBKRTimeoutError("Timed out waiting for IBKR PnL update")
+
+
+def fetch_positions(
+    ib,
+    account_id: str | None = None,
+    *,
+    budget_user_id: int | None = None,
+) -> pd.DataFrame:
+    """Fetch IBKR positions and normalize to DataFrame."""
+    guard_ib_call(
+        operation="reqPositions",
+        fn=ib.reqPositions,
+        budget_user_id=budget_user_id,
+    )
+    positions = list(ib.positions() or [])
+
+    rows: list[dict[str, Any]] = []
+    for pos in positions:
+        acct = getattr(pos, "account", None)
+        if account_id and acct != account_id:
+            continue
+        contract = getattr(pos, "contract", None)
+        rows.append(
+            {
+                "account": acct,
+                "symbol": getattr(contract, "symbol", None) if contract else None,
+                "sec_type": getattr(contract, "secType", None) if contract else None,
+                "currency": getattr(contract, "currency", None) if contract else None,
+                "exchange": getattr(contract, "exchange", None) if contract else None,
+                "con_id": getattr(contract, "conId", None) if contract else None,
+                "position": _safe_float(getattr(pos, "position", None)),
+                "avg_cost": _safe_float(getattr(pos, "avgCost", None)),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=_POSITION_COLUMNS)
+    frame = pd.DataFrame(rows, columns=_POSITION_COLUMNS)
+    return frame.sort_values(["account", "symbol"], na_position="last").reset_index(drop=True)
+
+
+def fetch_portfolio_items(
+    ib,
+    account_id: str | None = None,
+    *,
+    budget_user_id: int | None = None,
+) -> pd.DataFrame:
+    """Fetch IBKR portfolio items with market values via reqAccountUpdates."""
+    items = list(ib.portfolio() or [])
+    if not items:
+        guard_ib_call(
+            operation="reqAccountUpdates",
+            fn=ib.reqAccountUpdates,
+            kwargs={"account": account_id or ""},
+            budget_user_id=budget_user_id,
+        )
+        items = list(ib.portfolio() or [])
+    return _portfolio_frame_from_items(items, account_id=account_id)
+
+
+def fetch_cash_balances(
+    ib,
+    account_id: str | None = None,
+    *,
+    budget_user_id: int | None = None,
+) -> dict[str, float]:
+    """Fetch per-currency cash balances from accountValues (CashBalance tag)."""
+    account_values = list(ib.accountValues(account=account_id) or [])
+    if not account_values:
+        guard_ib_call(
+            operation="reqAccountUpdates",
+            fn=ib.reqAccountUpdates,
+            kwargs={"account": account_id or ""},
+            budget_user_id=budget_user_id,
+        )
+        account_values = list(ib.accountValues(account=account_id) or [])
+    return _cash_balances_from_account_values(account_values, account_id=account_id)
+
+
+def fetch_portfolio_with_cash(
+    ib,
+    account_id: str | None = None,
+    *,
+    budget_user_id: int | None = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Fetch portfolio items and cash balances with at most one cold refresh."""
+    items = list(ib.portfolio() or [])
+    account_values = list(ib.accountValues(account=account_id) or [])
+
+    if not items or not account_values:
+        guard_ib_call(
+            operation="reqAccountUpdates",
+            fn=ib.reqAccountUpdates,
+            kwargs={"account": account_id or ""},
+            budget_user_id=budget_user_id,
+        )
+        if not items:
+            items = list(ib.portfolio() or [])
+        if not account_values:
+            account_values = list(ib.accountValues(account=account_id) or [])
+
+    return (
+        _portfolio_frame_from_items(items, account_id=account_id),
+        _cash_balances_from_account_values(account_values, account_id=account_id),
+    )
+
+
+def fetch_account_summary(
+    ib,
+    account_id: str | None = None,
+    *,
+    budget_user_id: int | None = None,
+) -> dict[str, float]:
     """Fetch account summary values with USD-only tag normalization."""
     account_values = list(ib.accountValues(account=account_id) or [])
     if not account_values:
-        ib.reqAccountUpdates(account=account_id)
+        guard_ib_call(
+            operation="reqAccountUpdates",
+            fn=ib.reqAccountUpdates,
+            kwargs={"account": account_id},
+            budget_user_id=budget_user_id,
+        )
         account_values = list(ib.accountValues(account=account_id) or [])
 
     summary: dict[str, float] = {}
@@ -217,11 +303,18 @@ def fetch_pnl(
     ib,
     account_id: str,
     *,
+    budget_user_id: int | None = None,
     timeout_seconds: float = IBKR_PNL_TIMEOUT,
     poll_interval: float = IBKR_PNL_POLL_INTERVAL,
 ) -> dict[str, float | str | None]:
     """Fetch account-level PnL via streaming subscription with timeout polling."""
-    pnl_obj = ib.reqPnL(account_id, modelCode="")
+    pnl_obj = guard_ib_call(
+        operation="reqPnL",
+        fn=ib.reqPnL,
+        args=(account_id,),
+        kwargs={"modelCode": ""},
+        budget_user_id=budget_user_id,
+    )
     try:
         _wait_for_pnl_ready(
             ib,
@@ -237,7 +330,15 @@ def fetch_pnl(
         }
     finally:
         try:
-            ib.cancelPnL(account_id, modelCode="")
+            guard_ib_call(
+                operation="cancelPnL",
+                fn=ib.cancelPnL,
+                args=(account_id,),
+                kwargs={"modelCode": ""},
+                budget_user_id=budget_user_id,
+            )
+        except BudgetExceededError:
+            raise
         except Exception:
             pass
 
@@ -247,11 +348,18 @@ def fetch_pnl_single(
     account_id: str,
     con_id: int,
     *,
+    budget_user_id: int | None = None,
     timeout_seconds: float = IBKR_PNL_TIMEOUT,
     poll_interval: float = IBKR_PNL_POLL_INTERVAL,
 ) -> dict[str, float | int | str | None]:
     """Fetch contract-level PnL via streaming subscription with timeout polling."""
-    pnl_obj = ib.reqPnLSingle(account_id, modelCode="", conId=int(con_id))
+    pnl_obj = guard_ib_call(
+        operation="reqPnLSingle",
+        fn=ib.reqPnLSingle,
+        args=(account_id,),
+        kwargs={"modelCode": "", "conId": int(con_id)},
+        budget_user_id=budget_user_id,
+    )
     try:
         _wait_for_pnl_ready(
             ib,
@@ -270,6 +378,14 @@ def fetch_pnl_single(
         }
     finally:
         try:
-            ib.cancelPnLSingle(account_id, modelCode="", conId=int(con_id))
+            guard_ib_call(
+                operation="cancelPnLSingle",
+                fn=ib.cancelPnLSingle,
+                args=(account_id,),
+                kwargs={"modelCode": "", "conId": int(con_id)},
+                budget_user_id=budget_user_id,
+            )
+        except BudgetExceededError:
+            raise
         except Exception:
             pass

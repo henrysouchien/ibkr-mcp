@@ -34,9 +34,19 @@ def log_event(logger: logging.Logger, level: int, event: str, msg: str = "", **f
 class TimingContext:
     """Context manager for elapsed time measurement."""
 
+    def __init__(self, name: str | None = None):
+        self.name = name
+
     def __enter__(self):
         self.start = time.monotonic()
         return self
 
     def __exit__(self, *args):
         self.elapsed_ms = round((time.monotonic() - self.start) * 1000, 1)
+        if self.name:
+            try:
+                from app_platform.logging.core import log_timing_event
+
+                log_timing_event("dependency", self.name, self.elapsed_ms)
+            except Exception:
+                pass

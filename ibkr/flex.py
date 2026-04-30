@@ -10,6 +10,7 @@ Upstream reference:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import importlib
 import re
@@ -21,24 +22,26 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import certifi
 import yaml
+from app_platform.api_budget import BudgetExceededError
 from ib_async import FlexReport
 
 from ._logging import logger
+from ._budget import guard_ib_call
 from ._types import InstrumentType
 from ._vendor import normalize_strike, safe_float
 
 try:
     _ticker_resolver = importlib.import_module("utils.ticker_resolver")
-    _resolve_fmp_ticker = getattr(_ticker_resolver, "resolve_fmp_ticker", None)
+    _resolve_ticker_from_exchange = getattr(_ticker_resolver, "resolve_ticker_from_exchange", None)
 except Exception:
-    _resolve_fmp_ticker = None
+    _resolve_ticker_from_exchange = None
 
 
 _warned_missing_ticker_resolver = False
 _FUTURES_MONTH_CODES = set("FGHJKMNQUVXZ")
 
 
-def resolve_fmp_ticker(
+def resolve_ticker_from_exchange(
     ticker: str,
     company_name: str | None = None,
     currency: str | None = None,
@@ -46,8 +49,8 @@ def resolve_fmp_ticker(
     **kwargs: Any,
 ) -> str:
     """Resolve FMP ticker with guarded fallback when monorepo resolver is unavailable."""
-    if _resolve_fmp_ticker is not None:
-        return _resolve_fmp_ticker(
+    if _resolve_ticker_from_exchange is not None:
+        return _resolve_ticker_from_exchange(
             ticker=ticker,
             company_name=company_name,
             currency=currency,
@@ -338,7 +341,7 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
                     # IBKR can report trailing-dot symbols (e.g., "AT."); strip before suffix resolution.
                     base_symbol = symbol.rstrip(".")
                     if base_symbol:
-                        symbol = resolve_fmp_ticker(
+                        symbol = resolve_ticker_from_exchange(
                             ticker=base_symbol,
                             company_name=None,
                             currency=str(_get_attr(trade, "currency", default="USD") or "USD").upper(),
@@ -359,16 +362,49 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
                 _get_attr(trade, "ibCommission", "commission", "commissionAmount"),
                 0.0,
             )
+        ) + abs(
+            safe_float(
+                _get_attr(trade, "taxes"),
+                0.0,
+            )
         )
+        broker_cost_basis = None
+        broker_pnl = None
+        open_close = str(
+            _get_attr(trade, "openCloseIndicator", "openClose", default="") or ""
+        ).upper()
+        if trade_type in ("SELL", "COVER") and open_close != "O" and not is_futures:
+            raw_cost = safe_float(_get_attr(trade, "cost"), 0.0)
+            raw_qty = abs(safe_float(_get_attr(trade, "quantity", "qty"), 0.0))
+            if abs(raw_cost) > 0 and raw_qty > 0:
+                broker_cost_basis = abs(raw_cost) / raw_qty
+            raw_pnl = safe_float(_get_attr(trade, "fifoPnlRealized"), 0.0)
+            if raw_pnl != 0:
+                broker_pnl = float(raw_pnl)
 
         currency = str(_get_attr(trade, "currency", default="USD") or "USD").upper()
         account_id = str(_get_attr(trade, "accountId", "accountID", default="") or "")
+        raw_code = str(_get_attr(trade, "code", "notes", default="") or "").strip()
+        code_parts = {p.strip().upper() for p in raw_code.split(";") if p.strip()}
+
+        _has_exercise_token = any(
+            tok in ("EX", "AEX", "MEX") or tok.endswith("EX")
+            for tok in code_parts
+        )
+        _has_assignment_token = "A" in code_parts or "GEA" in code_parts
+        is_exercise = _has_exercise_token and not _has_assignment_token
+        is_assignment = _has_assignment_token
+        is_exercise_or_assignment = is_exercise or is_assignment
         trade_id = _get_attr(trade, "tradeID", "transactionID", "execID")
         if trade_id is None or str(trade_id).strip() == "":
             trade_id = f"row_{len(normalized)}"
 
         # Option closing at $0 = expired worthless
-        option_expired = is_option and price == 0 and trade_type in ("SELL", "COVER")
+        option_expired = (
+            is_option and price == 0
+            and trade_type in ("SELL", "COVER")
+            and not is_exercise_or_assignment
+        )
 
         normalized.append(
             {
@@ -378,6 +414,8 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
                 "quantity": quantity,
                 "price": price,
                 "fee": fee,
+                "broker_cost_basis": broker_cost_basis,
+                "broker_pnl": broker_pnl,
                 "currency": currency,
                 "source": "ibkr_flex",
                 "transaction_id": f"ibkr_flex_{trade_id}",
@@ -386,6 +424,14 @@ def normalize_flex_trades(flex_trades: Iterable[Any]) -> List[Dict[str, Any]]:
                 "instrument_type": instrument_type,
                 "contract_identity": contract_identity,
                 "option_expired": option_expired,
+                "option_exercised": is_option and is_exercise_or_assignment and trade_type in ("SELL", "COVER"),
+                "stock_from_exercise": (
+                    not is_option and not is_futures
+                    and is_exercise_or_assignment
+                    and trade_type in ("BUY", "SELL")
+                ),
+                "underlying": underlying,
+                "exercise_code": raw_code if is_exercise_or_assignment else None,
                 "account_id": account_id,
                 "_institution": "ibkr",
             }
@@ -664,6 +710,14 @@ def _select_dedup_winner(
     *,
     synthetic_prefixes: tuple[str, ...],
 ) -> dict[str, Any]:
+    def _dedup_sort_key(row: dict[str, Any]) -> tuple[str, int, str, int, str]:
+        transaction_id = str(row.get("transaction_id") or "")
+        account_id = _dedup_account_id(row)
+        account_name = str(row.get("account_name") or "").strip()
+        has_acct = 0 if account_id else 1
+        has_name = 0 if account_name else 1
+        return (transaction_id, has_acct, account_id, has_name, account_name)
+
     real_rows = [
         row
         for row in rows
@@ -673,8 +727,90 @@ def _select_dedup_winner(
         )
     ]
     if real_rows:
-        return min(real_rows, key=lambda row: str(row.get("transaction_id") or ""))
-    return min(rows, key=lambda row: str(row.get("transaction_id") or ""))
+        return min(real_rows, key=_dedup_sort_key)
+    return min(rows, key=_dedup_sort_key)
+
+
+def _should_filter_non_detail(raw_rows: Iterable[dict[str, Any]]) -> bool:
+    """Return True if we should filter non-DETAIL levelOfDetail rows.
+
+    Only filters when at least one DETAIL row exists - if ALL rows are
+    SUMMARY (abnormal Flex config), keep everything to avoid data loss.
+    """
+    for row in raw_rows:
+        lod = str(row.get("levelOfDetail") or "").strip().upper()
+        if lod == "DETAIL":
+            return True
+    return False
+
+
+def _cross_currency_dedup(
+    grouped_rows: list[dict[str, Any]],
+    normalized_base_currency: str,
+) -> list[dict[str, Any]]:
+    """Deduplicate cross-currency rows while preserving distinct events."""
+    if len(grouped_rows) <= 1:
+        return list(grouped_rows)
+
+    currencies = {_normalize_flex_currency(row.get("currency")) for row in grouped_rows}
+    if len(currencies) <= 1:
+        return list(grouped_rows)
+
+    base_currency_rows = [
+        row
+        for row in grouped_rows
+        if _normalize_flex_currency(row.get("currency")) == normalized_base_currency
+    ]
+
+    base_equivalents: list[tuple[int, float]] = []
+    all_have_fx = True
+    for index, row in enumerate(grouped_rows):
+        fx_rate = safe_float(row.get("fx_rate_to_base"), 0.0)
+        if fx_rate == 0.0:
+            all_have_fx = False
+            break
+        raw_amount = _parse_cash_amount(row.get("amount"), default=0.0)
+        base_equivalents.append((index, raw_amount * fx_rate))
+
+    if not all_have_fx:
+        if base_currency_rows:
+            return base_currency_rows
+        return list(grouped_rows)
+
+    base_equivalents.sort(key=lambda item: item[1])
+
+    tolerance = 0.10
+    clusters: list[list[int]] = []
+    cluster_amounts: list[float] = []
+    for index, base_amount in base_equivalents:
+        matched = False
+        for cluster_index, reference_amount in enumerate(cluster_amounts):
+            if abs(base_amount - reference_amount) < tolerance:
+                clusters[cluster_index].append(index)
+                matched = True
+                break
+        if not matched:
+            clusters.append([index])
+            cluster_amounts.append(base_amount)
+
+    if len(clusters) == 1:
+        if base_currency_rows:
+            return base_currency_rows
+        return list(grouped_rows)
+
+    deduped: list[dict[str, Any]] = []
+    for cluster in clusters:
+        cluster_rows = [grouped_rows[index] for index in cluster]
+        base_rows_in_cluster = [
+            row
+            for row in cluster_rows
+            if _normalize_flex_currency(row.get("currency")) == normalized_base_currency
+        ]
+        if base_rows_in_cluster:
+            deduped.extend(base_rows_in_cluster)
+            continue
+        deduped.extend(cluster_rows)
+    return deduped
 
 
 def normalize_flex_cash_income_trades(
@@ -682,12 +818,27 @@ def normalize_flex_cash_income_trades(
     base_currency: str = "USD",
 ) -> list[dict[str, Any]]:
     """Convert raw Flex CashTransaction dividend/interest rows to trade-format records."""
+    raw_cash_rows_list = list(raw_cash_rows)
+    _filter_lod = _should_filter_non_detail(raw_cash_rows_list)
     normalized: list[dict[str, Any]] = []
 
-    for index, row in enumerate(raw_cash_rows):
+    for row in raw_cash_rows_list:
         trade_type = _income_trade_type_for_cash_type(str(row.get("type") or "").strip().upper())
         if not trade_type:
             continue
+
+        lod = str(row.get("levelOfDetail") or "").strip().upper()
+        if _filter_lod and lod and lod != "DETAIL":
+            continue
+        account_id = _normalize_identifier(row.get("accountId") or row.get("accountID"))
+        if not lod and account_id == "-":
+            logger.warning(
+                "CashTransaction income row with accountId='-' missing levelOfDetail; "
+                "keeping row but may be a summary duplicate: date=%s type=%s amount=%s",
+                row.get("dateTime") or row.get("date"),
+                row.get("type"),
+                row.get("amount"),
+            )
 
         event_dt = _parse_flex_date(row.get("dateTime") or row.get("date") or row.get("reportDate"))
         if event_dt is None:
@@ -703,9 +854,8 @@ def normalize_flex_cash_income_trades(
             if "(" in desc:
                 symbol = desc.split("(")[0].strip().upper()
         if not symbol:
-            symbol = "UNKNOWN"
+            symbol = "MARGIN_INTEREST" if trade_type == "INTEREST" else "UNKNOWN"
 
-        account_id = _normalize_identifier(row.get("accountId") or row.get("accountID"))
         account_name = _normalize_identifier(
             row.get("accountAlias")
             or row.get("acctAlias")
@@ -715,10 +865,11 @@ def normalize_flex_cash_income_trades(
             row.get("transactionID") or row.get("tradeID") or row.get("id")
         )
         if transaction_id is None:
-            transaction_id = (
-                f"income:{account_id or account_name or 'unknown'}:{event_dt.isoformat()}:"
-                f"{_normalize_flex_currency(row.get('currency'))}:{trade_type}:{abs(amount):.8f}:{index}"
+            content = (
+                f"income:{event_dt.date().isoformat()}:{symbol}:"
+                f"{_normalize_flex_currency(row.get('currency'))}:{trade_type}:{amount:.8f}"
             )
+            transaction_id = f"income:{hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}"
 
         normalized.append(
             {
@@ -738,6 +889,7 @@ def normalize_flex_cash_income_trades(
                 "account_id": account_id,
                 "account_name": account_name,
                 "_institution": "ibkr",
+                "fx_rate_to_base": safe_float(row.get("fxRateToBase"), 0.0),
             }
         )
 
@@ -775,25 +927,7 @@ def normalize_flex_cash_income_trades(
 
     normalized = []
     for grouped_rows in cross_currency_grouped.values():
-        if len(grouped_rows) <= 1:
-            normalized.extend(grouped_rows)
-            continue
-
-        currencies = {_normalize_flex_currency(row.get("currency")) for row in grouped_rows}
-        if len(currencies) <= 1:
-            normalized.extend(grouped_rows)
-            continue
-
-        base_currency_rows = [
-            row
-            for row in grouped_rows
-            if _normalize_flex_currency(row.get("currency")) == normalized_base_currency
-        ]
-        if base_currency_rows:
-            normalized.extend(base_currency_rows)
-            continue
-
-        normalized.extend(grouped_rows)
+        normalized.extend(_cross_currency_dedup(grouped_rows, normalized_base_currency))
 
     normalized.sort(
         key=lambda row: (
@@ -809,9 +943,9 @@ def normalize_flex_futures_mtm(
     raw_stmtfunds_rows: Iterable[dict[str, Any]],
     base_currency: str = "USD",
 ) -> list[dict[str, Any]]:
-    """Convert Flex StmtFunds futures Position MTM rows to normalized cash-settlement events."""
+    """Convert Flex StmtFunds futures cash-settlement rows (Position MTM + trade execution) to normalized events."""
     normalized: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, float, str]] = set()
+    seen: set[tuple[str, str, str, float, str, str]] = set()
     row_group_keys: list[tuple[str, str, str]] = []
 
     for index, row in enumerate(raw_stmtfunds_rows):
@@ -824,9 +958,9 @@ def normalize_flex_futures_mtm(
 
         description = str(row.get("activityDescription") or row.get("description") or "").strip()
         description_upper = description.upper()
-        if "POSITION MTM" not in description_upper:
-            continue
-        if description_upper.startswith("BUY") or description_upper.startswith("SELL"):
+        is_position_mtm = "POSITION MTM" in description_upper
+        is_trade_execution = description_upper.startswith("BUY ") or description_upper.startswith("SELL ")
+        if not is_position_mtm and not is_trade_execution:
             continue
 
         event_dt = _parse_flex_date(row.get("reportDate") or row.get("dateTime") or row.get("date"))
@@ -857,6 +991,7 @@ def normalize_flex_futures_mtm(
             raw_symbol,
             round(amount, 8),
             currency,
+            description[:20],
         )
         if dedup_key in seen:
             continue
@@ -955,7 +1090,12 @@ def _build_overlap_key(row: dict[str, Any]) -> tuple[str, str, str, str, str, fl
     )
 
 
-def _normalize_cash_transaction_row(raw_row: dict[str, Any], row_index: int) -> dict[str, Any]:
+def _normalize_cash_transaction_row(
+    raw_row: dict[str, Any],
+    row_index: int,
+    *,
+    filter_non_detail: bool = False,
+) -> dict[str, Any]:
     amount = _parse_cash_amount(raw_row.get("amount"), default=0.0)
     raw_type = str(raw_row.get("type") or "").strip().upper()
     flow_type, is_external, signed_amount, transfer_cash_confirmed = _cash_classification(raw_type, amount)
@@ -967,6 +1107,17 @@ def _normalize_cash_transaction_row(raw_row: dict[str, Any], row_index: int) -> 
         return {}
 
     account_id = _normalize_identifier(raw_row.get("accountId") or raw_row.get("accountID"))
+    lod = str(raw_row.get("levelOfDetail") or "").strip().upper()
+    if filter_non_detail and lod and lod != "DETAIL":
+        return {}
+    if not lod and account_id == "-":
+        logger.warning(
+            "CashTransaction row with accountId='-' missing levelOfDetail; "
+            "keeping row but may be a summary duplicate: date=%s type=%s amount=%s",
+            raw_row.get("dateTime") or raw_row.get("date"),
+            raw_row.get("type"),
+            raw_row.get("amount"),
+        )
     account_name = _normalize_identifier(raw_row.get("accountAlias") or raw_row.get("accountName"))
     provider_account_ref = _normalize_identifier(raw_row.get("accountAlias"))
     transaction_id = _normalize_identifier(
@@ -997,6 +1148,7 @@ def _normalize_cash_transaction_row(raw_row: dict[str, Any], row_index: int) -> 
         "raw_subtype": str(raw_row.get("code") or ""),
         "raw_description": str(raw_row.get("description") or ""),
         "section": "CashTransaction",
+        "fx_rate_to_base": safe_float(raw_row.get("fxRateToBase"), 0.0),
     }
 
 
@@ -1061,11 +1213,13 @@ def normalize_flex_cash_rows(
     transfer_rows: Iterable[dict[str, Any]],
     base_currency: str = "USD",
 ) -> list[dict[str, Any]]:
+    cash_rows_list = list(cash_rows)
+    _filter_lod = _should_filter_non_detail(cash_rows_list)
     normalized: list[dict[str, Any]] = []
     primary_overlap_keys: set[tuple[str, str, str, str, str, float, str]] = set()
 
-    for index, row in enumerate(cash_rows):
-        normalized_row = _normalize_cash_transaction_row(row, index)
+    for index, row in enumerate(cash_rows_list):
+        normalized_row = _normalize_cash_transaction_row(row, index, filter_non_detail=_filter_lod)
         if not normalized_row:
             continue
         normalized.append(normalized_row)
@@ -1111,25 +1265,7 @@ def normalize_flex_cash_rows(
 
     normalized = []
     for grouped_rows in cross_currency_grouped.values():
-        if len(grouped_rows) <= 1:
-            normalized.extend(grouped_rows)
-            continue
-
-        currencies = {_normalize_flex_currency(row.get("currency")) for row in grouped_rows}
-        if len(currencies) <= 1:
-            normalized.extend(grouped_rows)
-            continue
-
-        base_currency_rows = [
-            row
-            for row in grouped_rows
-            if _normalize_flex_currency(row.get("currency")) == normalized_base_currency
-        ]
-        if base_currency_rows:
-            normalized.extend(base_currency_rows)
-            continue
-
-        normalized.extend(grouped_rows)
+        normalized.extend(_cross_currency_dedup(grouped_rows, normalized_base_currency))
 
     normalized.sort(
         key=lambda row: (
@@ -1188,6 +1324,7 @@ def _download_flex_report(
     token: str,
     query_id: str,
     *,
+    budget_user_id: int | None = None,
     poll_interval: int = 3,
     poll_timeout: int = 60,
 ) -> tuple[Any | None, str | None]:
@@ -1213,9 +1350,17 @@ def _download_flex_report(
     url = f"{base_url}{params}"
 
     try:
-        resp = urlopen(url, timeout=30)
+        resp = guard_ib_call(
+            operation="flex_send_request",
+            fn=urlopen,
+            args=(url,),
+            kwargs={"timeout": 30},
+            budget_user_id=budget_user_id,
+        )
         data = resp.read()
         root = ET.fromstring(data)
+    except BudgetExceededError:
+        raise
     except Exception as exc:
         exc_msg = _redact_credentials(str(exc), token, query_id)
         return None, f"IBKR Flex Phase 1 request failed: {exc_msg}"
@@ -1249,9 +1394,17 @@ def _download_flex_report(
         poll_params = urlencode({"q": ref_code, "t": token, "v": "3"})
         poll_url = f"{ref_url}?{poll_params}"
         try:
-            resp = urlopen(poll_url, timeout=30)
+            resp = guard_ib_call(
+                operation="flex_get_statement",
+                fn=urlopen,
+                args=(poll_url,),
+                kwargs={"timeout": 30},
+                budget_user_id=budget_user_id,
+            )
             poll_data = resp.read()
             poll_root = ET.fromstring(poll_data)
+        except BudgetExceededError:
+            raise
         except Exception as exc:
             exc_msg = _redact_credentials(str(exc), token, query_id)
             return None, f"IBKR Flex Phase 2 poll failed: {exc_msg}"
@@ -1285,11 +1438,50 @@ def _download_flex_report(
     )
 
 
+def _report_xml_text(report: Any, *, path: str | None = None) -> str | None:
+    if path:
+        try:
+            return Path(path).read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+    data = getattr(report, "data", None)
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    if isinstance(data, str):
+        return data
+
+    root = getattr(report, "root", None)
+    if root is None:
+        return None
+
+    import xml.etree.ElementTree as ET
+
+    try:
+        return ET.tostring(root, encoding="unicode")
+    except Exception:
+        return None
+
+
+def _write_report_xml(raw_xml: str | None, save_xml_path: str | None) -> None:
+    if not raw_xml or not save_xml_path:
+        return
+
+    target = Path(save_xml_path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(raw_xml, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to save IBKR Flex XML to %s: %s", save_xml_path, exc)
+
+
 def _load_flex_report(
     *,
     token: str = "",
     query_id: str = "",
     path: Optional[str] = None,
+    save_xml_path: str | None = None,
+    budget_user_id: int | None = None,
 ) -> tuple[Any | None, str | None]:
     # --- Path loading ---
     if path:
@@ -1304,22 +1496,35 @@ def _load_flex_report(
         error_code, error_msg = _check_flex_error_response(report)
         if error_code is not None:
             return None, f"IBKR Flex error {error_code} in {path}: {error_msg}"
+        _write_report_xml(_report_xml_text(report, path=path), save_xml_path)
         return report, None
 
     # --- Download ---
     if not token or not query_id:
         return None, "IBKR Flex credentials missing; skipping Flex download"
-    return _download_flex_report(token, query_id)
+    report, load_error = _download_flex_report(
+        token,
+        query_id,
+        budget_user_id=budget_user_id,
+    )
+    if report is not None:
+        _write_report_xml(_report_xml_text(report), save_xml_path)
+    return report, load_error
 
 
 def fetch_ibkr_flex_payload(
     token: str = "",
     query_id: str = "",
     path: Optional[str] = None,
+    *,
+    budget_user_id: int | None = None,
+    raw_xml: bool = False,
+    save_xml_path: str | None = None,
 ) -> Dict[str, Any]:
     """Download/load IBKR Flex report and return trades + cash rows + MTM + diagnostics."""
     payload: Dict[str, Any] = {
         "trades": [],
+        "trades_raw": [],
         "cash_rows": [],
         "futures_mtm": [],
         "option_price_history": [],
@@ -1332,12 +1537,23 @@ def fetch_ibkr_flex_payload(
         "transfer_section_present": False,
         "stmtfunds_section_present": False,
     }
+    if raw_xml:
+        payload["raw_xml"] = None
 
-    report, load_error = _load_flex_report(token=token, query_id=query_id, path=path)
+    report, load_error = _load_flex_report(
+        token=token,
+        query_id=query_id,
+        path=path,
+        save_xml_path=save_xml_path,
+        budget_user_id=budget_user_id,
+    )
     if load_error is not None:
         logger.warning("%s", load_error)
         payload["fetch_error"] = load_error
         return payload
+
+    if raw_xml:
+        payload["raw_xml"] = _report_xml_text(report, path=path)
 
     window_start, window_end = _report_window(report)
     payload["fetch_window_start"] = window_start
@@ -1352,6 +1568,7 @@ def fetch_ibkr_flex_payload(
     payload["stmtfunds_section_present"] = stmtfunds_topic_present
 
     raw_trades = _extract_rows(report, "Trade")
+    payload["trades_raw"] = list(raw_trades)
     if raw_trades:
         payload["trades"] = normalize_flex_trades(raw_trades)
 
@@ -1385,15 +1602,47 @@ def fetch_ibkr_flex_payload(
     return payload
 
 
+def fetch_flex_report(
+    *,
+    path: str | None = None,
+    token: str | None = None,
+    query_id: str | None = None,
+    budget_user_id: int | None = None,
+    raw_xml: bool = False,
+    save_xml_path: str | None = None,
+) -> Dict[str, Any]:
+    """Canonical public wrapper for fetching parsed IBKR Flex payloads."""
+
+    payload_kwargs: dict[str, Any] = {
+        "token": token or "",
+        "query_id": query_id or "",
+        "path": path,
+        "raw_xml": raw_xml,
+        "save_xml_path": save_xml_path,
+    }
+    if budget_user_id is not None:
+        payload_kwargs["budget_user_id"] = budget_user_id
+    return fetch_ibkr_flex_payload(**payload_kwargs)
+
+
 def fetch_ibkr_flex_trades(
     token: str = "",
     query_id: str = "",
     path: Optional[str] = None,
+    *,
+    budget_user_id: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Download/load IBKR Flex trades and normalize to FIFO transaction format."""
     if path and not Path(path).exists():
         raise FileNotFoundError(f"IBKR Flex XML file not found: {path}")
-    payload = fetch_ibkr_flex_payload(token=token, query_id=query_id, path=path)
+    payload_kwargs: dict[str, Any] = {
+        "token": token,
+        "query_id": query_id,
+        "path": path,
+    }
+    if budget_user_id is not None:
+        payload_kwargs["budget_user_id"] = budget_user_id
+    payload = fetch_ibkr_flex_payload(**payload_kwargs)
     return list(payload.get("trades") or [])
 
 
@@ -1403,8 +1652,9 @@ def extract_statement_cash(
     """Extract starting/ending cash from materialized IBKR statement SQLite.
 
     Searches for any table matching cash_report% and extracts the Base
-    Currency Summary Starting/Ending Cash rows. Returns None if the file
-    doesn't exist, the table is missing, or required rows are absent.
+    Currency Summary Starting/Ending Cash rows. When available, also extracts
+    statement period start/end dates from a statement% table. Returns None if
+    the file doesn't exist, the table is missing, or required rows are absent.
     """
     if not statement_db_path or not Path(statement_db_path).exists():
         return None
@@ -1430,25 +1680,50 @@ def extract_statement_cash(
             "WHERE currency = 'Base Currency Summary' "
             "AND currency_summary IN ('Starting Cash', 'Ending Cash')"
         ).fetchall()
+        result: dict[str, Any] = {}
+        for row in rows:
+            label = str(row["currency_summary"]).strip()
+            try:
+                value = float(row["total"])
+            except (TypeError, ValueError):
+                continue
+            if label == "Starting Cash":
+                result["starting_cash_usd"] = value
+            elif label == "Ending Cash":
+                result["ending_cash_usd"] = value
+
+        if "starting_cash_usd" not in result or "ending_cash_usd" not in result:
+            return None
+
+        try:
+            stmt_tables = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name LIKE 'statement%' ORDER BY name"
+                ).fetchall()
+            ]
+            if stmt_tables:
+                stmt_table = next((t for t in stmt_tables if t.endswith("__all")), stmt_tables[0])
+                stmt_rows = conn.execute(
+                    f"SELECT field_value FROM [{stmt_table}] "
+                    "WHERE field_name = 'Period'"
+                ).fetchall()
+                if stmt_rows:
+                    period_str = str(stmt_rows[0][0]).strip()
+                    parts = period_str.split(" - ")
+                    if len(parts) == 2:
+                        from dateutil.parser import parse as parse_date
+
+                        result["period_start"] = parse_date(parts[0]).strftime("%Y-%m-%d")
+                        result["period_end"] = parse_date(parts[1]).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+        result["source"] = "ibkr_statement"
+        result["db_path"] = str(statement_db_path)
+        return result
     except Exception:
         return None
     finally:
         conn.close()
-
-    result: dict[str, Any] = {}
-    for row in rows:
-        label = str(row["currency_summary"]).strip()
-        try:
-            value = float(row["total"])
-        except (TypeError, ValueError):
-            continue
-        if label == "Starting Cash":
-            result["starting_cash_usd"] = value
-        elif label == "Ending Cash":
-            result["ending_cash_usd"] = value
-
-    if "starting_cash_usd" not in result or "ending_cash_usd" not in result:
-        return None
-    result["source"] = "ibkr_statement"
-    result["db_path"] = str(statement_db_path)
-    return result
