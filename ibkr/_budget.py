@@ -5,8 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from app_platform.api_budget import guard_call
-from config.api_budget_costs import COST_PER_CALL
+try:
+    from app_platform.api_budget import guard_call
+except ImportError:
+    def guard_call(*, fn, args=(), kwargs=None, **_):
+        """No-op fallback when app_platform.api_budget isn't installed (dist runtime)."""
+        return fn(*args, **(kwargs or {}))
+
+from ibkr._shared.api_budget_costs import COST_PER_CALL
 
 
 def ibkr_cost_per_call(operation: str) -> Any:

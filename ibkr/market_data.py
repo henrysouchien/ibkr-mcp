@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
-from app_platform.api_budget import BudgetExceededError
+from ibkr._shared.budget_exceptions import BudgetExceededError
 
 from ._logging import log_event, logger, TimingContext
 from ._budget import guard_ib_call

@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from app_platform.api_budget import BudgetExceededError
+from ibkr._shared.budget_exceptions import BudgetExceededError
 
 from ._budget import guard_ib_call
 from .config import IBKR_PNL_POLL_INTERVAL, IBKR_PNL_TIMEOUT

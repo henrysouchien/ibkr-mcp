@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any, List, Optional
 
-from app_platform.api_budget import BudgetExceededError
+from ibkr._shared.budget_exceptions import BudgetExceededError
 
 from ._logging import log_event, logger, TimingContext
 from ._budget import guard_ib_call

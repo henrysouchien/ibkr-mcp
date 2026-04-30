@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import certifi
 import yaml
-from app_platform.api_budget import BudgetExceededError
+from ibkr._shared.budget_exceptions import BudgetExceededError
 from ib_async import FlexReport
 
 from ._logging import logger
