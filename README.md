@@ -1,6 +1,6 @@
 # ibkr-mcp
 
-MCP server for Interactive Brokers Gateway — 6 tools for market data and account access via Claude.
+MCP server for Interactive Brokers Gateway — 7 tools for market data and account access via Claude.
 
 ## Tools
 
@@ -12,6 +12,7 @@ MCP server for Interactive Brokers Gateway — 6 tools for market data and accou
 | `get_ibkr_contract` | Contract lookup and details |
 | `get_ibkr_option_prices` | Option chain pricing |
 | `get_ibkr_snapshot` | Real-time quote snapshot |
+| `get_ibkr_status` | IBKR Gateway connection diagnostics |
 
 ## Install
 
@@ -69,4 +70,4 @@ python -m ibkr.server   # via module
 
 ## License
 
-MIT
+PolyForm Noncommercial 1.0.0
