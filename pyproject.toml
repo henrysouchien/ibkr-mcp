@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "interactive-brokers-mcp"
-version = "0.2.3"
+version = "0.2.4"
 description = "MCP server for Interactive Brokers Gateway — 6 tools for market data and account access via Claude"
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
