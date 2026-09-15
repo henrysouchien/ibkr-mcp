@@ -3,6 +3,16 @@
 All notable changes to `interactive-brokers-mcp` are documented here. Entries follow the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) convention.
 
+## [0.2.5] - 2026-09-15
+
+### Changed
+- Published seven-tool catalog: `get_ibkr_market_data`, `get_ibkr_positions`, `get_ibkr_account`, `get_ibkr_contract`, `get_ibkr_option_prices`, `get_ibkr_snapshot`, and `get_ibkr_status`.
+- Depends on `brokerage-connect[ibkr]>=0.6.2,<1`.
+- `ibkr_mcp` re-exports `IBKRClient`, `IBKRContractError`, and `IBKRDataError` from `brokerage.ibkr`.
+
+### Fixed
+- Removed `sys.path` mutation; standalone imports resolve through the installed packages.
+
 ## [0.2.4] — 2026-04-30
 
 ### Fixed

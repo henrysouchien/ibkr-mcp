@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "interactive-brokers-mcp"
 version = "0.2.4"
-description = "MCP server for Interactive Brokers Gateway — 6 tools for market data and account access via Claude"
+description = "MCP server for Interactive Brokers Gateway — 7 tools for market data and account access via Claude"
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
 requires-python = ">=3.11"
@@ -17,8 +17,9 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "python-dotenv>=1.0,<2",
     "fastmcp>=3.1,<4",
-    "certifi>=2024.0.0",
+    "certifi>=2024.0.0,<2027",
     "zstandard>=0.23,<1",
+    "brokerage-connect[ibkr]>=0.6.2,<1",
 ]
 
 [project.urls]
@@ -29,7 +30,11 @@ Source = "https://github.com/henrysouchien/ibkr-mcp"
 ibkr-mcp = "ibkr.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["ibkr", "ibkr_mcp"]
+packages = ["ibkr_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"__init__.py" = "ibkr/__init__.py"
+"server.py" = "ibkr/server.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["ibkr/", "ibkr_mcp/", "pyproject.toml", "README.md", "LICENSE"]
+include = ["/*.py", "/ibkr_mcp", "pyproject.toml", "README.md", "LICENSE"]

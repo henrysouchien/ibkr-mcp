@@ -1,1 +1,0 @@
-# Utils package for Flask app modularization 

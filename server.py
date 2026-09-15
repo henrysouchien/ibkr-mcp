@@ -15,12 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from dotenv import load_dotenv
 from fastmcp import FastMCP
-
-_pkg_dir = Path(__file__).resolve().parent
-load_dotenv(_pkg_dir / ".env", override=False)
-load_dotenv(_pkg_dir.parent / ".env", override=False)
 
 try:
     import nest_asyncio
@@ -104,10 +99,13 @@ def get_ibkr_market_data(
     """Fetch historical price series from IBKR Gateway.
 
     symbols accepts a JSON array string or comma-separated symbols.
+    Related IBKR tools: get_ibkr_contract resolves contract metadata first;
+    get_ibkr_snapshot fetches latest quotes; get_ibkr_account and
+    get_ibkr_positions inspect account state.
     """
 
     def _impl() -> dict:
-        from .client import IBKRClient
+        from brokerage.ibkr import IBKRClient
 
         parsed_symbols = parse_list(symbols) or []
         if not parsed_symbols:
@@ -150,10 +148,15 @@ def get_ibkr_positions(
     include_pnl: bool = False,
     account_id: Optional[str] = None,
 ) -> dict:
-    """Fetch current IBKR positions and optionally account-level PnL."""
+    """Fetch current IBKR positions and optionally account-level PnL.
+
+    Related IBKR tools: get_ibkr_account summarizes account metrics,
+    get_ibkr_market_data fetches historical prices, and get_ibkr_contract
+    resolves contract metadata.
+    """
 
     def _impl() -> dict:
-        from .client import IBKRClient
+        from brokerage.ibkr import IBKRClient
 
         client = IBKRClient()
         positions_df = client.get_positions(account_id=account_id)
@@ -176,10 +179,15 @@ def get_ibkr_positions(
 
 @mcp.tool()
 def get_ibkr_account(account_id: Optional[str] = None) -> dict:
-    """Fetch IBKR account summary metrics."""
+    """Fetch IBKR account summary metrics.
+
+    Related IBKR tools: get_ibkr_positions lists holdings,
+    get_ibkr_contract resolves securities, and get_ibkr_market_data fetches
+    historical price series.
+    """
 
     def _impl() -> dict:
-        from .client import IBKRClient
+        from brokerage.ibkr import IBKRClient
 
         client = IBKRClient()
         summary = client.get_account_summary(account_id=account_id)
@@ -194,19 +202,29 @@ def get_ibkr_account(account_id: Optional[str] = None) -> dict:
 @mcp.tool()
 def get_ibkr_contract(
     symbol: str,
+    currency: str,
     sec_type: str = "STK",
     info_type: Literal["details", "option_chain"] = "details",
     exchange: str = "SMART",
-    currency: str = "USD",
 ) -> dict:
-    """Fetch contract details or option chain metadata from IBKR."""
+    """Fetch contract details or option chain metadata from IBKR.
+
+    Related IBKR tools: get_ibkr_market_data and get_ibkr_snapshot use
+    resolved contract fields for pricing; get_ibkr_option_prices snapshots
+    option strikes.
+    """
 
     def _impl() -> dict:
-        from .client import IBKRClient
+        from brokerage.ibkr import IBKRClient
 
         client = IBKRClient()
         if info_type == "option_chain":
-            chain = client.get_option_chain(symbol=symbol.upper(), sec_type=sec_type, exchange=exchange)
+            chain = client.get_option_chain(
+                symbol=symbol.upper(),
+                currency=currency,
+                sec_type=sec_type,
+                exchange=exchange,
+            )
             return {"status": "success", "info_type": "option_chain", "chain": chain}
 
         details = client.get_contract_details(
@@ -228,17 +246,19 @@ def get_ibkr_option_prices(
     symbol: str,
     expiry: str,
     strikes: str,
+    currency: str,
     right: str = "P",
 ) -> dict:
     """Snapshot bid/ask/greeks for multiple option strikes.
 
     strikes accepts a JSON array string or comma-separated values.
+    Related IBKR tools: get_ibkr_contract discovers option-chain metadata,
+    get_ibkr_market_data fetches historical series, and get_ibkr_snapshot
+    fetches latest single-contract quotes.
     """
 
     def _impl() -> dict:
-        from ib_async import Option
-
-        from .client import IBKRClient
+        from brokerage.ibkr import IBKRClient, IBKRContractSpec
 
         normalized_symbol = str(symbol or "").strip().upper()
         normalized_right = str(right or "").strip().upper()
@@ -251,7 +271,13 @@ def get_ibkr_option_prices(
 
         client = IBKRClient()
         contracts = [
-            Option(normalized_symbol, expiry, float(strike), normalized_right, "SMART")
+            IBKRContractSpec.option(
+                normalized_symbol,
+                expiry=expiry,
+                strike=float(strike),
+                right=normalized_right,
+                currency=currency,
+            )
             for strike in parsed_strikes
         ]
         snapshots = client.fetch_snapshot(contracts=contracts)
@@ -282,24 +308,35 @@ def get_ibkr_snapshot(
     exchange: str = "SMART",
     currency: str = "USD",
 ) -> dict:
-    """Snapshot latest price for any security."""
+    """Snapshot latest price for a stock or futures contract.
+
+    Related IBKR tools: get_ibkr_contract resolves contract metadata first,
+    get_ibkr_market_data fetches historical prices, get_ibkr_option_prices
+    fetches option quotes, and get_ibkr_account checks Gateway account state.
+    """
 
     def _impl() -> dict:
-        from ib_async import Contract, Stock
-
-        from .client import IBKRClient
+        from brokerage.ibkr import IBKRClient, IBKRContractSpec
 
         normalized_symbol = str(symbol or "").strip().upper()
         normalized_sec_type = str(sec_type or "").strip().upper()
 
         if normalized_sec_type == "STK":
-            contract = Stock(normalized_symbol, exchange, currency)
-        else:
-            contract = Contract(
-                symbol=normalized_symbol,
-                secType=normalized_sec_type,
+            contract = IBKRContractSpec.stock(
+                normalized_symbol,
                 exchange=exchange,
                 currency=currency,
+            )
+        elif normalized_sec_type == "FUT":
+            contract = IBKRContractSpec.future(
+                normalized_symbol,
+                exchange=exchange,
+                currency=currency,
+            )
+        else:
+            raise ValueError(
+                "get_ibkr_snapshot supports sec_type 'STK' or 'FUT'; "
+                "use get_ibkr_option_prices for options"
             )
 
         client = IBKRClient()
@@ -322,10 +359,14 @@ def get_ibkr_snapshot(
 
 @mcp.tool()
 def get_ibkr_status() -> dict:
-    """Return IBKR Gateway connection status for diagnostics."""
+    """Return IBKR Gateway connection status for diagnostics.
+
+    Related IBKR tools: get_ibkr_account and get_ibkr_positions validate
+    account access; get_ibkr_market_data validates market-data access.
+    """
 
     def _impl() -> dict:
-        from .client import IBKRClient
+        from brokerage.ibkr import IBKRClient
 
         client = IBKRClient()
         return {"status": "success", **client.get_connection_status()}
