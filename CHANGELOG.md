@@ -3,6 +3,11 @@
 All notable changes to `interactive-brokers-mcp` are documented here. Entries follow the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) convention.
 
+## [0.2.9] - 2026-09-16
+
+### Changed
+- Admits PyArrow 23–25 (`>=23.0.1,<26`) and requires the compatible `brokerage-connect[ibkr]>=0.6.6,<1`.
+
 ## [0.2.8] - 2026-09-15
 
 ### Changed
