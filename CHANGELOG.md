@@ -3,6 +3,11 @@
 All notable changes to `interactive-brokers-mcp` are documented here. Entries follow the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) convention.
 
+## [0.2.10] - 2026-09-16
+
+### Fixed
+- Excludes PyArrow 25.0.0 due to Apache Arrow #50471's worker-thread allocator crash and selects `brokerage-connect[ibkr]>=0.6.7,<1`.
+
 ## [0.2.9] - 2026-09-16
 
 ### Changed
