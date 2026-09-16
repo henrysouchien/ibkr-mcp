@@ -3,6 +3,14 @@
 All notable changes to `interactive-brokers-mcp` are documented here. Entries follow the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) convention.
 
+## [0.2.8] - 2026-09-15
+
+### Changed
+- Supports FastMCP 3 and 4 with `fastmcp>=3.2.4,<5`; the seven-tool MCP surface is unchanged.
+
+### Fixed
+- Includes the Python 3.14 console-startup repair: only apply `nest_asyncio` inside an already-running event loop.
+
 ## [0.2.5] - 2026-09-15
 
 ### Changed

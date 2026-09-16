@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "interactive-brokers-mcp"
-version = "0.2.6"
+version = "0.2.8"
 description = "MCP server for Interactive Brokers Gateway — 7 tools for market data and account access via Claude"
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -16,7 +16,7 @@ dependencies = [
     "pyarrow>=23.0.1,<24",
     "pyyaml>=6.0.3,<7",
     "python-dotenv>=1.2.2,<2",
-    "fastmcp>=3.2.4,<4",
+    "fastmcp>=3.2.4,<5",
     "certifi>=2026.2.25,<2027",
     "zstandard>=0.25.0,<1",
     "brokerage-connect[ibkr]>=0.6.5,<1",

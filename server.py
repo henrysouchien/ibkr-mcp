@@ -17,11 +17,10 @@ from typing import Any, Literal, Optional
 
 from fastmcp import FastMCP
 
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except Exception:
-    pass
+from brokerage.ibkr.asyncio_compat import apply_nest_asyncio_if_running_loop
+
+# Plain console startup must leave asyncio's task bookkeeping intact for AnyIO.
+apply_nest_asyncio_if_running_loop()
 
 # Restore stdout for MCP transport.
 sys.stdout = _real_stdout
